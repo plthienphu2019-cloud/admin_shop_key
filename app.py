@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # ==============================================================
-# LP-TOOL KEY SERVER — Render.com Edition
+# LP-TOOL KEY SERVER v2 — Render.com Edition
 # Admin: Thiên Phú - Minh Lâm
+# Full features: Create / List / Revoke / Activate / Hide / Delete / Extend / Reset
 # ==============================================================
 
 from __future__ import annotations
@@ -12,11 +13,10 @@ import time
 import random
 import string
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import wraps
-from typing import Any, Dict, Optional, Tuple
 
-from flask import Flask, request, jsonify, render_template_string, send_from_directory
+from flask import Flask, request, jsonify, render_template_string
 
 # ==============================================================
 # CONFIG
@@ -32,9 +32,11 @@ app = Flask(__name__)
 # ==============================================================
 
 def init_db():
-    """Khởi tạo database."""
+    """Khởi tạo database + migration."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # Bảng keys
     c.execute("""
         CREATE TABLE IF NOT EXISTS keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,6 +46,7 @@ def init_db():
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
             active INTEGER DEFAULT 1,
+            hidden INTEGER DEFAULT 0,
             created_by TEXT,
             note TEXT,
             device_id TEXT,
@@ -55,6 +58,14 @@ def init_db():
             banned_reason TEXT
         )
     """)
+
+    # Migration: thêm cột hidden nếu DB cũ chưa có
+    try:
+        c.execute("ALTER TABLE keys ADD COLUMN hidden INTEGER DEFAULT 0")
+    except Exception:
+        pass  # Đã có cột rồi
+
+    # Bảng logs
     c.execute("""
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,9 +77,12 @@ def init_db():
             created_at INTEGER NOT NULL
         )
     """)
+
+    # Index
     c.execute("CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_keys_device ON keys(device_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_logs_key ON logs(key)")
+
     conn.commit()
     conn.close()
 
@@ -222,7 +236,7 @@ def api_validate():
 
 
 # ==============================================================
-# API: HEARTBEAT (Tool gửi mỗi 60s)
+# API: HEARTBEAT
 # ==============================================================
 
 @app.route("/api/heartbeat", methods=["POST", "OPTIONS"])
@@ -269,7 +283,7 @@ def api_heartbeat():
 
 
 # ==============================================================
-# API: ADMIN (tạo / list / revoke / delete / extend / reset)
+# API: ADMIN — Tất cả actions
 # ==============================================================
 
 @app.route("/api/admin", methods=["POST", "OPTIONS"])
@@ -304,8 +318,8 @@ def api_admin():
 
         c.execute("""
             INSERT INTO keys (key, type, duration_hours, created_at, expires_at,
-                              active, created_by, note)
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                              active, hidden, created_by, note)
+            VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?)
         """, (key_str, key_type, duration_hours, now_ms, expires_at, created_by, note))
         conn.commit()
         log_action(key_str, "create", None, None,
@@ -322,6 +336,7 @@ def api_admin():
                 "created_at": now_ms,
                 "expires_at": expires_at,
                 "active": True,
+                "hidden": False,
                 "created_by": created_by,
                 "note": note,
             }
@@ -331,6 +346,10 @@ def api_admin():
     if action == "list":
         rows = c.execute("SELECT * FROM keys ORDER BY created_at DESC").fetchall()
         keys = [dict(r) for r in rows]
+        # Convert hidden boolean cho JS
+        for k in keys:
+            k["hidden"] = bool(k.get("hidden", 0))
+            k["active"] = bool(k.get("active", 1))
         conn.close()
         return jsonify({"ok": True, "keys": keys, "total": len(keys)})
 
@@ -344,21 +363,44 @@ def api_admin():
         conn.close()
         return jsonify({"ok": True, "message": "Đã thu hồi key"})
 
-    # ============ REACTIVATE ============
+    # ============ REACTIVATE (ACTIVA) ============
     if action == "reactivate":
         key_str = data.get("key")
         c.execute("UPDATE keys SET active=1, banned_reason=NULL WHERE key=?", (key_str,))
         conn.commit()
         log_action(key_str, "reactivate")
         conn.close()
-        return jsonify({"ok": True, "message": "Đã kích hoạt lại"})
+        return jsonify({"ok": True, "message": "Đã kích hoạt lại key"})
+
+    # ============ TOGGLE HIDE ============
+    if action == "toggle_hide":
+        key_str = data.get("key")
+        row = c.execute("SELECT * FROM keys WHERE key=?", (key_str,)).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"ok": False, "error": "Key không tồn tại"}), 404
+        row = dict(row)
+        new_hidden = not bool(row.get("hidden", 0))
+        c.execute("UPDATE keys SET hidden=? WHERE key=?",
+                  (1 if new_hidden else 0, key_str))
+        conn.commit()
+        log_action(key_str, "toggle_hide", None, None, {"hidden": new_hidden})
+        conn.close()
+        return jsonify({
+            "ok": True,
+            "hidden": new_hidden,
+            "message": "Đã ẩn key" if new_hidden else "Đã hiện key"
+        })
 
     # ============ DELETE ============
     if action == "delete":
         key_str = data.get("key")
-        c.execute("DELETE FROM keys WHERE key=?", (key_str,))
-        conn.commit()
-        log_action(key_str, "delete")
+        row = c.execute("SELECT * FROM keys WHERE key=?", (key_str,)).fetchone()
+        if row:
+            row = dict(row)
+            c.execute("DELETE FROM keys WHERE key=?", (key_str,))
+            conn.commit()
+            log_action(key_str, "delete", None, None, {"deleted_info": row})
         conn.close()
         return jsonify({"ok": True, "message": "Đã xoá key"})
 
@@ -391,17 +433,18 @@ def api_admin():
             WHERE key=?
         """, (new_exp, hours, key_str))
         conn.commit()
-        log_action(key_str, "extend", None, None, {"hours": hours})
+        log_action(key_str, "extend", None, None, {"hours": hours, "new_expires": new_exp})
         conn.close()
         return jsonify({"ok": True, "message": "Đã gia hạn", "expires_at": new_exp})
 
     # ============ STATS ============
     if action == "stats":
-        total = c.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
         now_ms = int(time.time() * 1000)
+        total = c.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
+        hidden_count = c.execute("SELECT COUNT(*) FROM keys WHERE hidden=1").fetchone()[0]
         active = c.execute("""
             SELECT COUNT(*) FROM keys
-            WHERE active=1 AND (expires_at > ? OR type='ADMIN')
+            WHERE active=1 AND hidden=0 AND (expires_at > ? OR type='ADMIN')
         """, (now_ms,)).fetchone()[0]
         used = c.execute("SELECT COUNT(*) FROM keys WHERE device_id IS NOT NULL").fetchone()[0]
         revoked = c.execute("SELECT COUNT(*) FROM keys WHERE active=0").fetchone()[0]
@@ -418,7 +461,8 @@ def api_admin():
             "ok": True,
             "stats": {
                 "total": total, "active": active, "used": used,
-                "revoked": revoked, "expired": expired, "byType": by_type
+                "revoked": revoked, "expired": expired,
+                "hidden": hidden_count, "byType": by_type
             }
         })
 
@@ -437,12 +481,46 @@ def api_admin():
         conn.close()
         return jsonify({"ok": True, "logs": logs})
 
+    # ============ AUTO CLEANUP ============
+    if action == "cleanup_expired":
+        """
+        Xoá các key hết hạn > 24h.
+        Trả về danh sách key đã xoá để frontend lưu vào lịch sử.
+        """
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - 24 * 3600 * 1000  # Hết hạn > 24h
+
+        rows = c.execute("""
+            SELECT * FROM keys
+            WHERE type != 'ADMIN'
+              AND expires_at IS NOT NULL
+              AND expires_at < ?
+        """, (cutoff_ms,)).fetchall()
+
+        deleted = []
+        for r in rows:
+            k = dict(r)
+            k["hidden"] = bool(k.get("hidden", 0))
+            k["active"] = bool(k.get("active", 1))
+            deleted.append(k)
+            c.execute("DELETE FROM keys WHERE id=?", (k["id"],))
+            log_action(k["key"], "auto_cleanup_expired", None, None, {"expires_at": k["expires_at"]})
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "ok": True,
+            "deleted_count": len(deleted),
+            "deleted_keys": deleted
+        })
+
     conn.close()
     return jsonify({"ok": False, "error": "Action không hợp lệ"}), 400
 
 
 # ==============================================================
-# ADMIN WEB UI
+# ADMIN WEB UI (giữ nguyên)
 # ==============================================================
 
 ADMIN_HTML = r"""
@@ -451,7 +529,7 @@ ADMIN_HTML = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>⚡ LP-TOOL KEY ADMIN ⚡</title>
+<title>⚡ LP-TOOL KEY ADMIN v2 ⚡</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Roboto, sans-serif; }
   :root {
@@ -503,6 +581,10 @@ ADMIN_HTML = r"""
   .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,212,255,0.55); }
   .btn-danger { background: linear-gradient(135deg, var(--red), #b91c3c); color: white; }
   .btn-warn { background: linear-gradient(135deg, var(--yellow), #f59e0b); color: #050a14; }
+  .btn-info { background: linear-gradient(135deg, #00d4ff, #2563eb); color: #050a14; }
+  .btn-info:hover { transform: translateY(-2px); }
+  .btn-gray { background: linear-gradient(135deg, #7a8ca3, #4b5563); color: white; }
+  .btn-gray:hover { transform: translateY(-2px); }
   .btn-small { padding: 6px 12px; font-size: 11px; }
   .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
   .key-item {
@@ -518,6 +600,7 @@ ADMIN_HTML = r"""
   .badge-active { background: rgba(0,230,118,0.15); color: var(--green); }
   .badge-revoked { background: rgba(255,77,109,0.15); color: var(--red); }
   .badge-expired { background: rgba(122,140,163,0.15); color: var(--gray); }
+  .badge-hidden-key { background: rgba(122,140,163,0.25); color: #aaa; }
   .key-value {
     font-family: 'Consolas', monospace; font-size: 12px;
     color: var(--cyan); background: rgba(0,0,0,0.4);
@@ -549,15 +632,17 @@ ADMIN_HTML = r"""
   .hidden { display: none !important; }
   .mt-10 { margin-top: 10px; }
   .filter-row { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .tab-active { background: linear-gradient(135deg, #00d4ff, #2563eb) !important; color: #050a14 !important; }
 </style>
 </head>
 <body>
 <div class="container">
 
+  <!-- LOGIN -->
   <div id="loginScreen" class="login-screen">
     <div class="card login-card">
       <div class="header">
-        <div class="logo">LP KEY</div>
+        <div class="logo">LP KEY v2</div>
         <div class="subtitle">⚡ ADMIN PANEL ⚡</div>
       </div>
       <div class="grid">
@@ -570,31 +655,34 @@ ADMIN_HTML = r"""
     </div>
   </div>
 
+  <!-- MAIN -->
   <div id="mainPanel" class="hidden">
     <div class="header">
-      <div class="logo">LP KEY ADMIN</div>
-      <div class="subtitle">⚡ RENDER + SQLITE ⚡</div>
+      <div class="logo">LP KEY ADMIN v2</div>
+      <div class="subtitle">⚡ RENDER + SQLITE + HIDE + CLEANUP ⚡</div>
     </div>
 
+    <!-- STATS -->
     <div class="card">
       <div class="card-title">📊 THỐNG KÊ</div>
       <div class="stats">
         <div class="stat-item"><div class="stat-value" id="statTotal">-</div><div class="stat-label">Tổng key</div></div>
         <div class="stat-item"><div class="stat-value" id="statActive" style="color:var(--green)">-</div><div class="stat-label">Hoạt động</div></div>
         <div class="stat-item"><div class="stat-value" id="statUsed" style="color:var(--cyan)">-</div><div class="stat-label">Đã kích hoạt</div></div>
-        <div class="stat-item"><div class="stat-value" id="statRevoked" style="color:var(--red)">-</div><div class="stat-label">Đã thu hồi</div></div>
+        <div class="stat-item"><div class="stat-value" id="statHidden" style="color:var(--gray)">-</div><div class="stat-label">Đã ẩn</div></div>
       </div>
     </div>
 
+    <!-- CREATE -->
     <div class="card">
       <div class="card-title">🎁 TẠO KEY MỚI</div>
       <div class="grid grid-3">
         <div>
           <label>Loại key</label>
           <select id="newType">
-            <option value="VIP1">🔓 VIP 1</option>
-            <option value="VIP3">🔐 VIP 3</option>
-            <option value="SUPER">👑 SUPER</option>
+            <option value="VIP1">🔓 VIP 1 (1-7 logic)</option>
+            <option value="VIP3">🔐 VIP 3 (1-10 logic)</option>
+            <option value="SUPER">👑 SUPER (full)</option>
             <option value="ADMIN">⚡ ADMIN (vĩnh viễn)</option>
           </select>
         </div>
@@ -605,7 +693,7 @@ ADMIN_HTML = r"""
             <option value="72">3 ngày (72h)</option>
             <option value="168">1 tuần (168h)</option>
             <option value="720">1 tháng (720h)</option>
-            <option value="880800">Vĩnh viễn (36700 ngày)</option>
+            <option value="880800">Vĩnh viễn</option>
           </select>
         </div>
         <div>
@@ -623,12 +711,21 @@ ADMIN_HTML = r"""
       </div>
     </div>
 
+    <!-- KEYS LIST -->
     <div class="card">
       <div class="card-title">
         📋 DANH SÁCH KEY
         <button class="btn btn-primary btn-small" style="margin-left:auto" onclick="loadKeys()">🔄 Refresh</button>
       </div>
-      <div class="filter-row">
+
+      <!-- TABS -->
+      <div class="filter-row" style="margin-bottom:12px;">
+        <button class="btn btn-small tab-active" id="tabMain" onclick="switchTab('main')">📋 Key chính</button>
+        <button class="btn btn-gray btn-small" id="tabHidden" onclick="switchTab('hidden')">👁️ Key đã ẩn</button>
+        <button class="btn btn-gray btn-small" id="tabDeleted" onclick="switchTab('deleted')">🗑️ Lịch sử xoá</button>
+      </div>
+
+      <div class="filter-row" id="filterRow">
         <input type="text" id="filterText" placeholder="🔍 Tìm key..." style="flex:1; min-width:200px;" oninput="renderKeys()">
         <select id="filterStatus" onchange="renderKeys()" style="width:auto;">
           <option value="all">Tất cả</option>
@@ -641,9 +738,19 @@ ADMIN_HTML = r"""
       <div id="keysList"></div>
     </div>
 
+    <!-- DELETED HISTORY -->
     <div class="card">
       <div class="card-title">
-        📜 NHẬT KÝ
+        🗑️ LỊCH SỬ KEY ĐÃ XOÁ
+        <button class="btn btn-danger btn-small" style="margin-left:auto" onclick="clearDeletedHistory()">🗑️ Xoá lịch sử</button>
+      </div>
+      <div id="deletedList"></div>
+    </div>
+
+    <!-- LOGS -->
+    <div class="card">
+      <div class="card-title">
+        📜 NHẬT KÝ HOẠT ĐỘNG
         <button class="btn btn-primary btn-small" style="margin-left:auto" onclick="loadLogs()">🔄 Refresh</button>
       </div>
       <div id="logsList" style="max-height:400px; overflow-y:auto;"></div>
@@ -661,6 +768,8 @@ ADMIN_HTML = r"""
 const API_BASE = window.location.origin;
 let adminSecret = '';
 let cachedKeys = [];
+let currentTab = 'main';
+let deletedHistory = JSON.parse(localStorage.getItem('lptool_deleted_history') || '[]');
 
 function toast(msg, type = 'success') {
   const t = document.getElementById('toast');
@@ -704,7 +813,7 @@ function doLogout() {
 function showMain() {
   document.getElementById('loginScreen').classList.add('hidden');
   document.getElementById('mainPanel').classList.remove('hidden');
-  loadStats(); loadKeys(); loadLogs();
+  loadStats(); loadKeys(); loadLogs(); switchTab('main');
 }
 
 let lastKey = null;
@@ -734,13 +843,34 @@ function hideNewKey() {
   lastKey = null;
 }
 
-async function loadKeys() {
-  try {
-    const j = await api('list');
-    if (!j.ok) return;
-    cachedKeys = j.keys || [];
+function switchTab(tab) {
+  currentTab = tab;
+  const tabs = {
+    main: document.getElementById('tabMain'),
+    hidden: document.getElementById('tabHidden'),
+    deleted: document.getElementById('tabDeleted'),
+  };
+  Object.keys(tabs).forEach(k => {
+    const el = tabs[k];
+    if (!el) return;
+    el.classList.remove('tab-active');
+    el.className = (k === tab)
+      ? 'btn btn-info btn-small tab-active'
+      : 'btn btn-gray btn-small';
+  });
+
+  const filterRow = document.getElementById('filterRow');
+  const keysList = document.getElementById('keysList');
+
+  if (tab === 'deleted') {
+    filterRow.style.display = 'none';
+    keysList.style.display = 'none';
+    renderDeletedHistory();
+  } else {
+    filterRow.style.display = 'flex';
+    keysList.style.display = 'block';
     renderKeys();
-  } catch (e) { toast('❌ ' + e.message, 'error'); }
+  }
 }
 
 function getKeyStatus(k) {
@@ -749,6 +879,8 @@ function getKeyStatus(k) {
   if (k.expires_at < now && k.type !== 'ADMIN') return 'expired';
   return 'active';
 }
+
+function isHiddenKey(k) { return k.hidden === true; }
 
 function formatTime(ts) {
   if (!ts) return '-';
@@ -763,6 +895,42 @@ function formatDuration(ms) {
   return `${hours}h`;
 }
 
+async function loadKeys() {
+  try {
+    const j = await api('list');
+    if (!j.ok) return;
+    cachedKeys = j.keys || [];
+    await autoCleanupExpired();
+    renderKeys();
+  } catch (e) { toast('❌ ' + e.message, 'error'); }
+}
+
+async function autoCleanupExpired() {
+  try {
+    const j = await api('cleanup_expired');
+    if (!j.ok || !j.deleted_count) return;
+
+    for (const k of j.deleted_keys) {
+      deletedHistory.unshift({
+        ...k,
+        deleted_at: new Date().toLocaleString('vi-VN'),
+        delete_reason: 'Hết hạn (tự động)',
+        delete_reason_type: 'expired',
+      });
+    }
+    if (deletedHistory.length > 100) deletedHistory = deletedHistory.slice(0, 100);
+    saveDeletedHistory();
+
+    toast(`🧹 Đã dọn ${j.deleted_count} key hết hạn`, 'info');
+
+    // Reload lại danh sách
+    const j2 = await api('list');
+    if (j2.ok) cachedKeys = j2.keys || [];
+  } catch (e) {
+    console.warn('Cleanup fail:', e);
+  }
+}
+
 function renderKeys() {
   const box = document.getElementById('keysList');
   const filterText = (document.getElementById('filterText').value || '').toLowerCase();
@@ -770,6 +938,8 @@ function renderKeys() {
   const now = Date.now();
 
   let list = cachedKeys.filter(k => {
+    if (currentTab === 'main' && isHiddenKey(k)) return false;
+    if (currentTab === 'hidden' && !isHiddenKey(k)) return false;
     if (filterText && !k.key.toLowerCase().includes(filterText) && !(k.note || '').toLowerCase().includes(filterText)) return false;
     const st = getKeyStatus(k);
     if (filterStatus === 'active' && st !== 'active') return false;
@@ -786,9 +956,11 @@ function renderKeys() {
 
   box.innerHTML = list.map(k => {
     const st = getKeyStatus(k);
+    const hidden = isHiddenKey(k);
     const statusBadge = st === 'active' ? '<span class="badge badge-active">✅ ACTIVE</span>'
       : st === 'expired' ? '<span class="badge badge-expired">⏰ HẾT HẠN</span>'
       : '<span class="badge badge-revoked">❌ THU HỒI</span>';
+    const hiddenBadge = hidden ? '<span class="badge badge-hidden-key">👁️ ĐÃ ẨN</span>' : '';
     const typeBadge = {
       VIP1: '<span class="badge badge-vip1">🔓 VIP1</span>',
       VIP3: '<span class="badge badge-vip3">🔐 VIP3</span>',
@@ -799,9 +971,9 @@ function renderKeys() {
     const deviceShort = k.device_id ? k.device_id.substring(0, 16) + '...' : 'chưa dùng';
 
     return `
-      <div class="key-item">
+      <div class="key-item" style="${hidden ? 'opacity:0.6; border-color:#555;' : ''}">
         <div class="key-header">
-          <div style="display:flex; gap:6px;">${typeBadge} ${statusBadge}</div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap;">${typeBadge} ${statusBadge} ${hiddenBadge}</div>
           <div style="font-size:11px; color:var(--gray);">🕐 ${formatTime(k.created_at)}</div>
         </div>
         <div class="key-value">${k.key}</div>
@@ -814,43 +986,135 @@ function renderKeys() {
         </div>
         <div class="btn-row mt-10">
           <button class="btn btn-primary btn-small" onclick="copyAnyKey('${k.key}')">📋 Copy</button>
-          ${st === 'active' ? `<button class="btn btn-warn btn-small" onclick="revokeKey('${k.key}')">🚫 Thu hồi</button>` : ''}
-          ${st === 'revoked' ? `<button class="btn btn-primary btn-small" onclick="reactivateKey('${k.key}')">✅ Bật lại</button>` : ''}
+          ${st === 'active'
+            ? `<button class="btn btn-warn btn-small" onclick="revokeKey('${k.key}')">🚫 Thu hồi</button>`
+            : `<button class="btn btn-info btn-small" onclick="activateKey('${k.key}')">⚡ Activa</button>`}
           ${k.device_id ? `<button class="btn btn-warn btn-small" onclick="resetDevice('${k.key}')">📱 Reset</button>` : ''}
           <button class="btn btn-primary btn-small" onclick="extendKey('${k.key}')">➕ Gia hạn</button>
+          <button class="btn btn-gray btn-small" onclick="toggleHideKey('${k.key}')">
+            ${hidden ? '👁️ Hiện' : '🙈 Ẩn'}
+          </button>
           <button class="btn btn-danger btn-small" onclick="deleteKey('${k.key}')">🗑️ Xoá</button>
         </div>
       </div>`;
   }).join('');
 }
 
+function renderDeletedHistory() {
+  const box = document.getElementById('deletedList');
+  if (!deletedHistory.length) {
+    box.innerHTML = '<div style="text-align:center; padding:30px; color:var(--gray);">📭 Chưa có key nào bị xoá</div>';
+    return;
+  }
+
+  box.innerHTML = deletedHistory.map(k => {
+    const typeBadge = {
+      VIP1: '<span class="badge badge-vip1">🔓 VIP1</span>',
+      VIP3: '<span class="badge badge-vip3">🔐 VIP3</span>',
+      SUPER: '<span class="badge badge-super">👑 SUPER</span>',
+      ADMIN: '<span class="badge badge-admin">⚡ ADMIN</span>',
+    }[k.type] || '';
+
+    const reason = k.delete_reason || 'Đã xoá';
+    const reasonColor = {
+      'expired': 'var(--gray)',
+      'manual': 'var(--red)',
+      'revoked': 'var(--red)',
+    }[k.delete_reason_type] || 'var(--yellow)';
+
+    return `
+      <div class="key-item" style="opacity:0.85;">
+        <div class="key-header">
+          <div style="display:flex; gap:6px; flex-wrap:wrap;">
+            ${typeBadge}
+            <span class="badge" style="background:rgba(255,77,109,0.15); color:${reasonColor};">🗑️ ${reason}</span>
+          </div>
+          <div style="font-size:11px; color:var(--gray);">🕐 ${k.deleted_at || '-'}</div>
+        </div>
+        <div class="key-value" style="color:#888;">${k.key}</div>
+        <div class="key-meta">
+          <div>⏱️ Hết hạn: <span>${formatTime(k.expires_at)}</span></div>
+          <div>👤 <span>${k.created_by || '-'}</span></div>
+          <div>📱 <span>${(k.device_id || 'chưa dùng').substring(0, 16)}...</span></div>
+          <div>🔢 <span>${k.use_count || 0} lần</span></div>
+          ${k.note ? `<div>📝 <span>${k.note}</span></div>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function clearDeletedHistory() {
+  if (!confirm('Xoá toàn bộ lịch sử key đã xoá?')) return;
+  deletedHistory = [];
+  saveDeletedHistory();
+  renderDeletedHistory();
+  toast('🗑️ Đã xoá lịch sử', 'success');
+}
+
+function saveDeletedHistory() {
+  localStorage.setItem('lptool_deleted_history', JSON.stringify(deletedHistory));
+}
+
 function copyAnyKey(k) { navigator.clipboard.writeText(k).then(() => toast('📋 Copy!', 'success')); }
 
 async function revokeKey(key) {
-  const reason = prompt('Lý do?', 'Admin revoked');
+  const reason = prompt('Lý do thu hồi?', 'Admin revoked');
   if (reason === null) return;
   const j = await api('revoke', { key, reason });
   if (j.ok) { toast('🚫 Đã thu hồi', 'success'); loadKeys(); loadStats(); }
+  else toast('❌ ' + j.error, 'error');
 }
-async function reactivateKey(key) {
+
+async function activateKey(key) {
+  if (!confirm('Kích hoạt lại key này?')) return;
   const j = await api('reactivate', { key });
-  if (j.ok) { toast('✅ Đã bật lại', 'success'); loadKeys(); loadStats(); }
+  if (j.ok) { toast('⚡ Đã kích hoạt lại', 'success'); loadKeys(); loadStats(); }
+  else toast('❌ ' + j.error, 'error');
 }
+
 async function resetDevice(key) {
-  if (!confirm('Reset device?')) return;
+  if (!confirm('Reset device cho key này?')) return;
   const j = await api('reset_device', { key });
   if (j.ok) { toast('📱 Đã reset', 'success'); loadKeys(); }
+  else toast('❌ ' + j.error, 'error');
 }
+
 async function extendKey(key) {
   const h = prompt('Gia hạn bao nhiêu giờ?', '24');
   if (!h) return;
   const j = await api('extend', { key, hours: parseInt(h) });
   if (j.ok) { toast('➕ Đã gia hạn', 'success'); loadKeys(); loadStats(); }
+  else toast('❌ ' + j.error, 'error');
 }
+
+async function toggleHideKey(key) {
+  const j = await api('toggle_hide', { key });
+  if (j.ok) {
+    toast(j.hidden ? '🙈 Đã ẩn key' : '👁️ Đã hiện key', 'success');
+    loadKeys();
+  } else toast('❌ ' + j.error, 'error');
+}
+
 async function deleteKey(key) {
-  if (!confirm('XOÁ VĨNH VIỄN?')) return;
+  if (!confirm('XOÁ VĨNH VIỄN key này?')) return;
+  const reason = prompt('Lý do xoá?', 'Admin xoá thủ công');
+  if (reason === null) return;
+
+  const keyData = cachedKeys.find(k => k.key === key);
+  if (keyData) {
+    deletedHistory.unshift({
+      ...keyData,
+      deleted_at: new Date().toLocaleString('vi-VN'),
+      delete_reason: reason,
+      delete_reason_type: 'manual',
+    });
+    if (deletedHistory.length > 100) deletedHistory = deletedHistory.slice(0, 100);
+    saveDeletedHistory();
+  }
+
   const j = await api('delete', { key });
   if (j.ok) { toast('🗑️ Đã xoá', 'success'); loadKeys(); loadStats(); }
+  else toast('❌ ' + j.error, 'error');
 }
 
 async function loadStats() {
@@ -859,7 +1123,7 @@ async function loadStats() {
   document.getElementById('statTotal').textContent = j.stats.total;
   document.getElementById('statActive').textContent = j.stats.active;
   document.getElementById('statUsed').textContent = j.stats.used;
-  document.getElementById('statRevoked').textContent = j.stats.revoked;
+  document.getElementById('statHidden').textContent = j.stats.hidden || 0;
 }
 
 async function loadLogs() {
@@ -869,7 +1133,7 @@ async function loadLogs() {
   if (!j.logs.length) { box.innerHTML = '<div style="text-align:center; padding:20px; color:var(--gray);">📭 Chưa có log</div>'; return; }
   box.innerHTML = j.logs.map(l => {
     const time = new Date(l.ts).toLocaleString('vi-VN');
-    const color = { create:'var(--green)', validate_ok:'var(--cyan)', bind_device:'var(--yellow)', revoke:'var(--red)', delete:'var(--red)', extend:'var(--green)' }[l.action] || 'var(--white)';
+    const color = { create:'var(--green)', validate_ok:'var(--cyan)', bind_device:'var(--yellow)', revoke:'var(--red)', delete:'var(--red)', extend:'var(--green)', toggle_hide:'var(--gray)', reactivate:'var(--cyan)', auto_cleanup_expired:'var(--gray)' }[l.action] || 'var(--white)';
     return `<div style="padding:8px; border-bottom:1px solid rgba(0,212,255,0.1); font-size:12px;">
       <span style="color:${color}; font-weight:700;">${l.action}</span>
       <span style="color:var(--gray); margin-left:8px;">${time}</span>
@@ -902,7 +1166,7 @@ def admin_page():
 @app.route("/")
 def index():
     return """
-    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>LP-TOOL KEY SERVER</title>
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>LP-TOOL KEY SERVER v2</title>
     <style>
       body { background:#050a14; color:#eaf2ff; font-family:sans-serif;
              display:flex; align-items:center; justify-content:center;
@@ -915,7 +1179,7 @@ def index():
           text-decoration:none; border-radius:8px; font-weight:700; }
     </style></head><body>
     <div class="box">
-      <h1>LP KEY</h1>
+      <h1>LP KEY v2</h1>
       <p>Server đang chạy. Truy cập /admin để quản lý key.</p>
       <a href="/admin">🚀 VÀO ADMIN</a>
     </div>
