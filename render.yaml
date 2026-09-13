@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: lptool-key
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
+    envVars:
+      - key: ADMIN_SECRET
+        value: LpToolAdmin@2026
+      - key: PYTHON_VERSION
+        value: 3.11.0
