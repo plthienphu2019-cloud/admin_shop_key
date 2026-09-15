@@ -1,27 +1,31 @@
 # -*- coding: utf-8 -*-
 # ==============================================================
-# LP-TOOL KEY SERVER — Render.com Edition + BẢO TRÌ + KÍCH HOẠT
+# LP-TOOL KEY SERVER — Render.com Edition
+# Full: Key Auth + Bảo Trì + Kích Hoạt + Thông Báo + Update Tool
+# Admin: Thiên Phú - Minh Lâm - Duy
 # ==============================================================
 
 from __future__ import annotations
 import os, sqlite3, time, random, json
-from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify, render_template_string
 
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "LpToolAdmin@2026")
 DB_PATH = os.environ.get("DB_PATH", "keys.db")
-
 app = Flask(__name__)
 
 # ==============================================================
-# BẢO TRÌ + KÍCH HOẠT STATE
+# STATE
 # ==============================================================
 MAINTENANCE = {"enabled": False, "content": "", "enabled_at": None}
 ACTIVATION = {
     "required": False, "activated": False,
     "message": "Vui lòng nhấn KÍCH HOẠT để bắt đầu sử dụng tool",
     "activated_at": None, "activated_by": None,
+}
+ANNOUNCEMENT = {
+    "enabled": False, "content": "",
+    "updated_at": None, "updated_by": None,
 }
 
 # ==============================================================
@@ -31,8 +35,9 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS keys (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE NOT NULL,
-        type TEXT NOT NULL, duration_hours INTEGER NOT NULL,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        key TEXT UNIQUE NOT NULL, type TEXT NOT NULL,
+        duration_hours INTEGER NOT NULL,
         created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
         active INTEGER DEFAULT 1, created_by TEXT, note TEXT,
         device_id TEXT, device_fingerprint TEXT, last_ip TEXT,
@@ -42,21 +47,28 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT,
         action TEXT NOT NULL, device_id TEXT, ip TEXT,
         info TEXT, created_at INTEGER NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS tool_code (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        version TEXT NOT NULL, code TEXT NOT NULL,
+        uploaded_at INTEGER NOT NULL, uploaded_by TEXT,
+        note TEXT, is_active INTEGER DEFAULT 1)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_logs_key ON logs(key)")
     conn.commit(); conn.close()
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     return conn
 
 def log_action(key, action, device_id=None, ip=None, info=None):
     try:
         conn = get_db(); c = conn.cursor()
         c.execute("INSERT INTO logs (key, action, device_id, ip, info, created_at) VALUES (?,?,?,?,?,?)",
-                  (key, action, device_id, ip, json.dumps(info or {}), int(time.time()*1000)))
+                  (key, action, device_id, ip, json.dumps(info or {}), int(time.time() * 1000)))
         conn.commit(); conn.close()
-    except Exception as e: print(f"log: {e}")
+    except Exception as e:
+        print(f"log_action: {e}")
 
 # ==============================================================
 # KEY GENERATOR
@@ -65,10 +77,12 @@ CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 def rand_str(n): return "".join(random.choice(CHARS) for _ in range(n))
 
 def generate_key(kt):
-    if kt == "VIP1": return f"LPTOOL_VIP1_{rand_str(5)}_{rand_str(4)}_{rand_str(4)}"
-    if kt == "VIP3": return f"LPTOOL_VIP3_{rand_str(2)}_{rand_str(5)}_{rand_str(4)}_{rand_str(6)}"
+    if kt == "VIP1":  return f"LPTOOL_VIP1_{rand_str(5)}_{rand_str(4)}_{rand_str(4)}"
+    if kt == "VIP3":  return f"LPTOOL_VIP3_{rand_str(2)}_{rand_str(5)}_{rand_str(4)}_{rand_str(6)}"
     if kt == "SUPER": return f"LPTOOL_PRENIUM_{rand_str(5)}_{rand_str(5)}_{rand_str(4)}_{rand_str(3)}_{rand_str(3)}_{rand_str(3)}"
-    if kt == "ADMIN": return f"LPTOOL_ADMIN_{rand_str(6)}_{rand_str(7)}_{rand_str(3)}_{rand_str(5)}_{rand_str(3)}_{rand_str(3)}_{rand_str(5)}_{rand_str(4)}_{rand_str(4)}_{rand_str(6)}"
+    if kt == "ADMIN":
+        return (f"LPTOOL_ADMIN_{rand_str(6)}_{rand_str(7)}_{rand_str(3)}_{rand_str(5)}_"
+                f"{rand_str(3)}_{rand_str(3)}_{rand_str(5)}_{rand_str(4)}_{rand_str(4)}_{rand_str(6)}")
     raise ValueError("Invalid")
 
 def require_admin(f):
@@ -100,31 +114,36 @@ def api_validate():
     if not row:
         conn.close(); return jsonify({"ok": False, "error": "Key không tồn tại"}), 404
 
-    row = dict(row); now = int(time.time()*1000)
+    row = dict(row); now = int(time.time() * 1000)
 
     if not row["active"]:
-        conn.close(); log_action(key_str, "validate_failed_inactive", device_id, ip)
+        conn.close(); log_action(key_str, "validate_fail_inactive", device_id, ip)
         return jsonify({"ok": False, "error": "Key đã bị thu hồi"}), 403
 
     if row["expires_at"] < now and row["type"] != "ADMIN":
-        conn.close(); log_action(key_str, "validate_failed_expired", device_id, ip)
+        conn.close(); log_action(key_str, "validate_fail_expired", device_id, ip)
         return jsonify({"ok": False, "error": "Key đã hết hạn"}), 403
 
     if not row["device_id"]:
-        c.execute("UPDATE keys SET device_id=?, device_fingerprint=?, first_used_at=?, last_seen=?, last_ip=?, use_count=1 WHERE id=?",
+        c.execute("""UPDATE keys SET device_id=?, device_fingerprint=?, first_used_at=?,
+                     last_seen=?, last_ip=?, use_count=1 WHERE id=?""",
                   (device_id, fp, now, now, ip, row["id"]))
         log_action(key_str, "bind_device", device_id, ip, {"fp": fp})
     elif row["device_id"] != device_id:
-        conn.close(); log_action(key_str, "validate_failed_wrong_device", device_id, ip)
+        conn.close(); log_action(key_str, "validate_fail_wrong_device", device_id, ip)
         return jsonify({"ok": False, "error": "Key đã kích hoạt trên thiết bị khác"}), 403
     else:
         c.execute("UPDATE keys SET last_seen=?, last_ip=?, use_count=use_count+1 WHERE id=?",
                   (now, ip, row["id"]))
 
     conn.commit(); log_action(key_str, "validate_ok", device_id, ip); conn.close()
-    return jsonify({"ok": True, "key_type": row["type"], "duration_hours": row["duration_hours"],
-                    "expires_at": row["expires_at"], "is_admin": row["type"]=="ADMIN",
-                    "created_by": row["created_by"], "message": "OK"})
+    return jsonify({
+        "ok": True, "key_type": row["type"],
+        "duration_hours": row["duration_hours"],
+        "expires_at": row["expires_at"],
+        "is_admin": row["type"] == "ADMIN",
+        "created_by": row["created_by"],
+    })
 
 # ==============================================================
 # API: HEARTBEAT
@@ -142,7 +161,7 @@ def api_heartbeat():
     row = c.execute("SELECT * FROM keys WHERE key=?", (key_str,)).fetchone()
     if not row:
         conn.close(); return jsonify({"ok": False, "error": "Key không tồn tại"}), 404
-    row = dict(row); now = int(time.time()*1000)
+    row = dict(row); now = int(time.time() * 1000)
 
     if not row["active"]:
         conn.close(); return jsonify({"ok": False, "error": "Key đã bị thu hồi"}), 403
@@ -157,7 +176,7 @@ def api_heartbeat():
     return jsonify({"ok": True})
 
 # ==============================================================
-# API: CHECK STATUS (Tool gọi mỗi 5s)
+# API: CHECK STATUS
 # ==============================================================
 @app.route("/api/check_status", methods=["GET", "POST", "OPTIONS"])
 def api_check_status():
@@ -169,11 +188,15 @@ def api_check_status():
         "need_activation": ACTIVATION["required"],
         "activated": ACTIVATION["activated"],
         "activation_message": ACTIVATION["message"],
-        "ts": int(time.time()*1000),
+        # ⚡ THÔNG BÁO
+        "announcement_enabled": ANNOUNCEMENT["enabled"],
+        "announcement_content": ANNOUNCEMENT["content"],
+        "announcement_updated_at": ANNOUNCEMENT["updated_at"],
+        "ts": int(time.time() * 1000),
     })
 
 # ==============================================================
-# API: ACTIVATE (Tool gọi khi user ấn Enter)
+# API: ACTIVATE
 # ==============================================================
 @app.route("/api/activate", methods=["POST", "OPTIONS"])
 def api_activate():
@@ -188,7 +211,6 @@ def api_activate():
     conn = get_db(); c = conn.cursor()
     row = c.execute("SELECT * FROM keys WHERE key=?", (key_str,)).fetchone()
     conn.close()
-
     if not row:
         return jsonify({"ok": False, "error": "Key không tồn tại"}), 404
 
@@ -196,12 +218,49 @@ def api_activate():
         return jsonify({"ok": True, "message": "Không cần kích hoạt", "skip": True})
 
     ACTIVATION["activated"] = True
-    ACTIVATION["activated_at"] = int(time.time()*1000)
+    ACTIVATION["activated_at"] = int(time.time() * 1000)
     ACTIVATION["activated_by"] = key_str
     log_action(key_str, "activation_confirmed", device_id)
 
-    return jsonify({"ok": True, "message": "✅ Kích hoạt thành công!",
-                    "activated_at": ACTIVATION["activated_at"]})
+    return jsonify({
+        "ok": True, "message": "✅ Kích hoạt thành công!",
+        "activated_at": ACTIVATION["activated_at"],
+    })
+
+# ==============================================================
+# API: TOOL AUTO-UPDATE
+# ==============================================================
+@app.route("/tool/version", methods=["GET"])
+def tool_version():
+    try:
+        conn = get_db(); c = conn.cursor()
+        row = c.execute(
+            "SELECT version, uploaded_at FROM tool_code WHERE is_active=1 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if row:
+            return jsonify({"ok": True, "version": row["version"], "uploaded_at": row["uploaded_at"]})
+        return jsonify({"ok": False, "error": "Chưa có tool"}), 404
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/tool/download", methods=["GET"])
+def tool_download():
+    try:
+        conn = get_db(); c = conn.cursor()
+        row = c.execute(
+            "SELECT code, version FROM tool_code WHERE is_active=1 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if row:
+            return row["code"], 200, {
+                "Content-Type": "text/plain; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "X-Version": row["version"],
+            }
+        return "Tool not found", 404
+    except Exception as e:
+        return str(e), 500
 
 # ==============================================================
 # API: ADMIN
@@ -215,6 +274,7 @@ def api_admin():
 
     conn = get_db(); c = conn.cursor()
 
+    # ============ CREATE KEY ============
     if action == "create":
         kt = data.get("type", "VIP1")
         dh = int(data.get("duration_hours", 24))
@@ -222,65 +282,77 @@ def api_admin():
         if kt not in ("VIP1", "VIP3", "SUPER", "ADMIN"):
             conn.close(); return jsonify({"ok": False, "error": "Loại không hợp lệ"}), 400
         if kt == "ADMIN": dh = 36700 * 24
-        key_str = generate_key(kt); now = int(time.time()*1000)
+        key_str = generate_key(kt); now = int(time.time() * 1000)
         exp = now + dh * 3600 * 1000
-        c.execute("INSERT INTO keys (key,type,duration_hours,created_at,expires_at,active,created_by,note) VALUES (?,?,?,?,?,1,?,?)",
-                  (key_str, kt, dh, now, exp, cb, note))
+        c.execute("""INSERT INTO keys (key,type,duration_hours,created_at,expires_at,active,created_by,note)
+                     VALUES (?,?,?,?,?,1,?,?)""", (key_str, kt, dh, now, exp, cb, note))
         conn.commit()
         log_action(key_str, "create", None, None, {"type": kt, "dh": dh})
         conn.close()
         return jsonify({"ok": True, "key": key_str})
 
+    # ============ LIST ============
     if action == "list":
         rows = c.execute("SELECT * FROM keys ORDER BY created_at DESC").fetchall()
         keys = [dict(r) for r in rows]; conn.close()
         return jsonify({"ok": True, "keys": keys, "total": len(keys)})
 
+    # ============ REVOKE ============
     if action == "revoke":
         key_str = data.get("key"); reason = data.get("reason", "Admin revoked")
         c.execute("UPDATE keys SET active=0, banned_reason=? WHERE key=?", (reason, key_str))
         conn.commit(); log_action(key_str, "revoke", None, None, {"reason": reason})
         conn.close(); return jsonify({"ok": True})
 
+    # ============ REACTIVATE ============
     if action == "reactivate":
         key_str = data.get("key")
         c.execute("UPDATE keys SET active=1, banned_reason=NULL WHERE key=?", (key_str,))
         conn.commit(); log_action(key_str, "reactivate")
         conn.close(); return jsonify({"ok": True})
 
+    # ============ DELETE ============
     if action == "delete":
         key_str = data.get("key")
         c.execute("DELETE FROM keys WHERE key=?", (key_str,))
         conn.commit(); log_action(key_str, "delete")
         conn.close(); return jsonify({"ok": True})
 
+    # ============ RESET DEVICE ============
     if action == "reset_device":
         key_str = data.get("key")
-        c.execute("UPDATE keys SET device_id=NULL, device_fingerprint=NULL, first_used_at=NULL WHERE key=?", (key_str,))
+        c.execute("""UPDATE keys SET device_id=NULL, device_fingerprint=NULL,
+                     first_used_at=NULL WHERE key=?""", (key_str,))
         conn.commit(); log_action(key_str, "reset_device")
         conn.close(); return jsonify({"ok": True})
 
+    # ============ EXTEND ============
     if action == "extend":
         key_str = data.get("key"); hours = int(data.get("hours", 24))
         row = c.execute("SELECT * FROM keys WHERE key=?", (key_str,)).fetchone()
-        if not row: conn.close(); return jsonify({"ok": False, "error": "Key không tồn tại"}), 404
-        row = dict(row); now = int(time.time()*1000)
-        base = max(row["expires_at"], now); new_exp = base + hours*3600*1000
+        if not row:
+            conn.close(); return jsonify({"ok": False, "error": "Key không tồn tại"}), 404
+        row = dict(row); now = int(time.time() * 1000)
+        base = max(row["expires_at"], now)
+        new_exp = base + hours * 3600 * 1000
         c.execute("UPDATE keys SET expires_at=?, active=1, duration_hours=duration_hours+? WHERE key=?",
                   (new_exp, hours, key_str))
         conn.commit(); log_action(key_str, "extend", None, None, {"hours": hours})
         conn.close(); return jsonify({"ok": True, "expires_at": new_exp})
 
+    # ============ MAINTENANCE ============
     if action == "maintenance":
         enabled = bool(data.get("enabled", False))
         content = str(data.get("content", "")).strip()
         MAINTENANCE["enabled"] = enabled
         MAINTENANCE["content"] = content
-        MAINTENANCE["enabled_at"] = int(time.time()*1000) if enabled else None
+        MAINTENANCE["enabled_at"] = int(time.time() * 1000) if enabled else None
         conn.close()
-        log_action(None, "maintenance_" + ("on" if enabled else "off"), None, None, {"content": content})
+        log_action(None, "maintenance_" + ("on" if enabled else "off"),
+                   None, None, {"content": content})
         return jsonify({"ok": True, "maintenance": MAINTENANCE})
 
+    # ============ ACTIVATION ============
     if action == "activation":
         required = bool(data.get("required", False))
         message = str(data.get("message", "")).strip()
@@ -292,23 +364,48 @@ def api_admin():
             ACTIVATION["activated_at"] = None
             ACTIVATION["activated_by"] = None
         conn.close()
-        log_action(None, "activation_" + ("on" if required else "off"), None, None, {"msg": message})
+        log_action(None, "activation_" + ("on" if required else "off"),
+                   None, None, {"msg": message})
         return jsonify({"ok": True, "activation": ACTIVATION})
 
+    # ============ ANNOUNCEMENT ============
+    if action == "announcement":
+        enabled = bool(data.get("enabled", False))
+        content = str(data.get("content", "")).strip()
+        ANNOUNCEMENT["enabled"] = enabled
+        ANNOUNCEMENT["content"] = content
+        ANNOUNCEMENT["updated_at"] = int(time.time() * 1000)
+        ANNOUNCEMENT["updated_by"] = "admin"
+        conn.close()
+        log_action(None, "announcement_" + ("on" if enabled else "off"),
+                   None, None, {"content": content[:100]})
+        return jsonify({"ok": True, "announcement": ANNOUNCEMENT})
+
+    # ============ GET STATUS ============
     if action == "get_status":
         conn.close()
-        return jsonify({"ok": True, "maintenance": MAINTENANCE, "activation": ACTIVATION})
+        return jsonify({
+            "ok": True,
+            "maintenance": MAINTENANCE,
+            "activation": ACTIVATION,
+            "announcement": ANNOUNCEMENT,
+        })
 
+    # ============ STATS ============
     if action == "stats":
         total = c.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
-        now = int(time.time()*1000)
+        now = int(time.time() * 1000)
         active = c.execute("SELECT COUNT(*) FROM keys WHERE active=1 AND (expires_at>? OR type='ADMIN')", (now,)).fetchone()[0]
         used = c.execute("SELECT COUNT(*) FROM keys WHERE device_id IS NOT NULL").fetchone()[0]
         revoked = c.execute("SELECT COUNT(*) FROM keys WHERE active=0").fetchone()[0]
         expired = c.execute("SELECT COUNT(*) FROM keys WHERE expires_at<? AND type!='ADMIN'", (now,)).fetchone()[0]
         conn.close()
-        return jsonify({"ok": True, "stats": {"total": total, "active": active, "used": used, "revoked": revoked, "expired": expired}})
+        return jsonify({"ok": True, "stats": {
+            "total": total, "active": active, "used": used,
+            "revoked": revoked, "expired": expired,
+        }})
 
+    # ============ LOGS ============
     if action == "logs":
         rows = c.execute("SELECT * FROM logs ORDER BY created_at DESC LIMIT 200").fetchall()
         logs = []
@@ -319,6 +416,50 @@ def api_admin():
             logs.append(d)
         conn.close(); return jsonify({"ok": True, "logs": logs})
 
+    # ============ UPLOAD TOOL ============
+    if action == "upload_tool":
+        version = str(data.get("version", "")).strip()
+        code = str(data.get("code", ""))
+        note = str(data.get("note", "")).strip()
+        if not version or not code:
+            conn.close(); return jsonify({"ok": False, "error": "Thiếu version/code"}), 400
+        if len(code) < 5000:
+            conn.close(); return jsonify({"ok": False, "error": "Code quá ngắn (<5KB)"}), 400
+        try:
+            compile(code, "tool.py", "exec")
+        except SyntaxError as e:
+            conn.close()
+            return jsonify({"ok": False, "error": f"Code lỗi dòng {e.lineno}: {e.msg}"}), 400
+        now_ms = int(time.time() * 1000)
+        c.execute("UPDATE tool_code SET is_active=0")
+        c.execute("""INSERT INTO tool_code (version, code, uploaded_at, uploaded_by, note, is_active)
+                     VALUES (?,?,?,?,?,1)""",
+                  (version, code, now_ms, "admin", note))
+        conn.commit()
+        log_action(None, "tool_upload", None, None, {"version": version, "size": len(code)})
+        conn.close()
+        return jsonify({"ok": True, "message": f"Đã upload v{version}",
+                        "version": version, "size": len(code)})
+
+    # ============ TOOL HISTORY ============
+    if action == "tool_history":
+        rows = c.execute("""SELECT id, version, uploaded_at, uploaded_by, note,
+                            is_active, LENGTH(code) AS size
+                            FROM tool_code ORDER BY id DESC LIMIT 20""").fetchall()
+        items = [dict(r) for r in rows]
+        conn.close()
+        return jsonify({"ok": True, "items": items})
+
+    # ============ DELETE TOOL ============
+    if action == "delete_tool":
+        tool_id = data.get("id")
+        if not tool_id:
+            conn.close(); return jsonify({"ok": False, "error": "Thiếu id"}), 400
+        c.execute("DELETE FROM tool_code WHERE id=?", (int(tool_id),))
+        conn.commit(); conn.close()
+        log_action(None, "tool_delete", None, None, {"id": tool_id})
+        return jsonify({"ok": True})
+
     conn.close()
     return jsonify({"ok": False, "error": "Action không hợp lệ"}), 400
 
@@ -327,10 +468,11 @@ def api_admin():
 # ==============================================================
 ADMIN_HTML = r"""<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>⚡ LP-TOOL KEY ADMIN ⚡</title>
+<title>⚡ LP-TOOL ADMIN ⚡</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Roboto,sans-serif}
-:root{--cyan:#00d4ff;--blue:#2563eb;--blue-light:#60a5fa;--green:#00e676;--yellow:#ffd740;--red:#ff4d6d;--gray:#7a8ca3;--white:#eaf2ff}
+:root{--cyan:#00d4ff;--blue:#2563eb;--blue-light:#60a5fa;--green:#00e676;
+--yellow:#ffd740;--red:#ff4d6d;--gray:#7a8ca3;--white:#eaf2ff}
 body{background:radial-gradient(ellipse at top,#0a1a3a 0%,#050a14 60%);color:var(--white);min-height:100vh;padding:20px}
 .container{max-width:1200px;margin:0 auto}
 .header{text-align:center;margin-bottom:24px}
@@ -387,12 +529,16 @@ input:focus,select:focus,textarea:focus{border-color:var(--cyan);box-shadow:0 0 
 </style></head><body><div class="container">
 
 <div id="loginScreen" class="login-screen"><div class="card login-card">
-<div class="header"><div class="logo">LP KEY</div><div class="subtitle">⚡ ADMIN PANEL ⚡</div></div>
-<div class="grid"><div><label>🔑 Admin Secret</label><input type="password" id="adminSecret" placeholder="Nhập admin secret..."></div>
-<button class="btn btn-primary" onclick="doLogin()">🚀 ĐĂNG NHẬP</button></div></div></div>
+<div class="header"><div class="logo">LP KEY</div>
+<div class="subtitle">⚡ ADMIN PANEL ⚡</div></div>
+<div class="grid"><div><label>🔑 Admin Secret</label>
+<input type="password" id="adminSecret" placeholder="Nhập admin secret..."></div>
+<button class="btn btn-primary" onclick="doLogin()">🚀 ĐĂNG NHẬP</button>
+</div></div></div>
 
 <div id="mainPanel" class="hidden">
-<div class="header"><div class="logo">LP KEY ADMIN</div><div class="subtitle">⚡ RENDER + SQLITE ⚡</div></div>
+<div class="header"><div class="logo">LP KEY ADMIN</div>
+<div class="subtitle">⚡ RENDER + SQLITE ⚡</div></div>
 
 <div class="card"><div class="card-title">📊 THỐNG KÊ</div>
 <div class="stats">
@@ -404,16 +550,41 @@ input:focus,select:focus,textarea:focus{border-color:var(--cyan);box-shadow:0 0 
 
 <div class="card">
 <div class="card-title">🔧 BẢO TRÌ <span class="status-pill off" id="mtPill">OFF</span></div>
-<div><label>Nội dung thông báo</label><textarea id="mtContent" rows="3" placeholder="VD: Server đang nâng cấp, quay lại sau 30 phút!"></textarea></div>
+<div><label>Nội dung thông báo</label>
+<textarea id="mtContent" rows="3" placeholder="Server đang nâng cấp, quay lại sau..."></textarea></div>
 <button class="toggle-btn toggle-on" id="mtBtn" onclick="toggleMaintenance()">🔧 BẬT BẢO TRÌ</button>
 <div style="font-size:11px;color:var(--gray);margin-top:8px">💡 Khi bật, tool đang chạy sẽ tự động thoát và hiện thông báo.</div>
 </div>
 
+<!-- ⚡ THÔNG BÁO MỚI -->
+<div class="card">
+<div class="card-title">📢 THÔNG BÁO <span class="status-pill off" id="anPill">OFF</span></div>
+<div><label>Nội dung thông báo cho user</label>
+<textarea id="anContent" rows="3" placeholder="VD: Bảo trì lúc 20h tối nay, quay lại sau!"></textarea></div>
+<button class="toggle-btn toggle-on" id="anBtn" onclick="toggleAnnouncement()">📢 BẬT THÔNG BÁO</button>
+<div style="font-size:11px;color:var(--gray);margin-top:8px">💡 Khi bật, tool của user sẽ hiện thông báo này ngay.</div>
+</div>
+
 <div class="card">
 <div class="card-title">⚡ YÊU CẦU KÍCH HOẠT <span class="status-pill off" id="acPill">OFF</span></div>
-<div><label>Nội dung yêu cầu user</label><input type="text" id="acMessage" value="Vui lòng nhấn KÍCH HOẠT để bắt đầu sử dụng tool"></div>
+<div><label>Nội dung yêu cầu user</label>
+<input type="text" id="acMessage" value="Vui lòng nhấn KÍCH HOẠT để bắt đầu sử dụng tool"></div>
 <button class="toggle-btn toggle-on" id="acBtn" onclick="toggleActivation()">⚡ BẬT YÊU CẦU KÍCH HOẠT</button>
-<div style="font-size:11px;color:var(--gray);margin-top:8px">💡 Khi bật, user phải nhấn Enter mới vào được tool.</div>
+</div>
+
+<div class="card">
+<div class="card-title">🚀 UPDATE TOOL <span class="status-pill off" id="toolPill">—</span></div>
+<div style="display:grid;grid-template-columns:1fr 2fr;gap:8px;margin-bottom:8px">
+<div><label>Version</label><input type="text" id="toolVersion" placeholder="1.0.1"></div>
+<div><label>Ghi chú</label><input type="text" id="toolNote" placeholder="VD: fix lỗi AI"></div>
+</div>
+<div><label>Code tool</label>
+<textarea id="toolCode" rows="10" placeholder="Paste toàn bộ plptoolv4.py..." style="font-family:monospace;font-size:11px"></textarea></div>
+<div class="btn-row mt-10">
+<button class="btn btn-primary" onclick="uploadTool()">🚀 UPLOAD</button>
+<button class="btn btn-warn" onclick="loadToolHistory()">📜 Lịch sử</button>
+</div>
+<div id="toolHistory" class="mt-10" style="max-height:250px;overflow-y:auto"></div>
 </div>
 
 <div class="card"><div class="card-title">🎁 TẠO KEY MỚI</div>
@@ -459,28 +630,31 @@ input:focus,select:focus,textarea:focus{border-color:var(--cyan);box-shadow:0 0 
 <script>
 const API_BASE = window.location.origin;
 let adminSecret = '', cachedKeys = [], lastKey = null;
-let currentMaintenance = false, currentActivation = false;
+let currentMaintenance = false, currentActivation = false, currentAnnouncement = false;
 
 function toast(msg, type='success'){
   const t = document.getElementById('toast');
   t.textContent = msg; t.className = 'toast show toast-' + type;
-  clearTimeout(t._timer); t._timer = setTimeout(()=>{t.className='toast toast-'+type},3000);
+  clearTimeout(t._timer);
+  t._timer = setTimeout(()=>{ t.className='toast toast-'+type; }, 3000);
 }
-
 async function api(action, data={}){
   const r = await fetch(`${API_BASE}/api/admin`,{
-    method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+adminSecret},
+    method:'POST',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+adminSecret},
     body: JSON.stringify({action, ...data})
   });
   const j = await r.json();
-  if(!j.ok && j.error === 'Unauthorized'){ toast('❌ Sai secret!','error'); throw new Error('Unauthorized'); }
+  if(!j.ok && j.error === 'Unauthorized'){
+    toast('❌ Sai secret!','error'); throw new Error('Unauthorized');
+  }
   return j;
 }
-
 function doLogin(){
   const s = document.getElementById('adminSecret').value.trim();
   if(!s){ toast('⚠️ Nhập secret!','error'); return; }
-  adminSecret = s; sessionStorage.setItem('lptool_secret', s);
+  adminSecret = s;
+  sessionStorage.setItem('lptool_secret', s);
   toast('✅ Đăng nhập!','success'); showMain();
 }
 function doLogout(){
@@ -492,16 +666,18 @@ function doLogout(){
 function showMain(){
   document.getElementById('loginScreen').classList.add('hidden');
   document.getElementById('mainPanel').classList.remove('hidden');
-  loadStats(); loadKeys(); loadLogs(); loadServerStatus();
+  loadStats(); loadKeys(); loadLogs(); loadServerStatus(); loadToolHistory();
   setInterval(loadServerStatus, 10000);
 }
-
 async function loadServerStatus(){
   try{
     const j = await api('get_status'); if(!j.ok) return;
     currentMaintenance = j.maintenance.enabled;
     currentActivation = j.activation.required;
-    const mtPill = document.getElementById('mtPill'), mtBtn = document.getElementById('mtBtn'), mtContent = document.getElementById('mtContent');
+
+    const mtPill = document.getElementById('mtPill');
+    const mtBtn = document.getElementById('mtBtn');
+    const mtContent = document.getElementById('mtContent');
     if(currentMaintenance){
       mtPill.textContent = 'ON'; mtPill.className = 'status-pill on';
       mtBtn.textContent = '✅ TẮT BẢO TRÌ'; mtBtn.className = 'toggle-btn toggle-off';
@@ -511,7 +687,9 @@ async function loadServerStatus(){
     }
     if(j.maintenance.content && !mtContent.value) mtContent.value = j.maintenance.content;
 
-    const acPill = document.getElementById('acPill'), acBtn = document.getElementById('acBtn'), acMsg = document.getElementById('acMessage');
+    const acPill = document.getElementById('acPill');
+    const acBtn = document.getElementById('acBtn');
+    const acMsg = document.getElementById('acMessage');
     if(currentActivation){
       const activated = j.activation.activated;
       acPill.textContent = activated ? 'ĐÃ KT' : 'CHỜ KT';
@@ -522,9 +700,24 @@ async function loadServerStatus(){
       acBtn.textContent = '⚡ BẬT YÊU CẦU KÍCH HOẠT'; acBtn.className = 'toggle-btn toggle-on';
     }
     if(j.activation.message && !acMsg.value) acMsg.value = j.activation.message;
+
+    // ⚡ THÔNG BÁO
+    if(j.announcement){
+      currentAnnouncement = j.announcement.enabled;
+      const anPill = document.getElementById('anPill');
+      const anBtn = document.getElementById('anBtn');
+      const anContent = document.getElementById('anContent');
+      if(currentAnnouncement){
+        anPill.textContent = 'ON'; anPill.className = 'status-pill on';
+        anBtn.textContent = '✅ TẮT THÔNG BÁO'; anBtn.className = 'toggle-btn toggle-off';
+      } else {
+        anPill.textContent = 'OFF'; anPill.className = 'status-pill off';
+        anBtn.textContent = '📢 BẬT THÔNG BÁO'; anBtn.className = 'toggle-btn toggle-on';
+      }
+      if(j.announcement.content && !anContent.value) anContent.value = j.announcement.content;
+    }
   } catch(e){}
 }
-
 async function toggleMaintenance(){
   const content = document.getElementById('mtContent').value.trim();
   if(!currentMaintenance && !content){ toast('⚠️ Nhập nội dung!','error'); return; }
@@ -535,7 +728,6 @@ async function toggleMaintenance(){
     if(j.ok){ toast(newState?'🔧 Đã BẬT!':'✅ Đã TẮT!','success'); loadServerStatus(); }
   } catch(e){ toast('❌ '+e.message,'error'); }
 }
-
 async function toggleActivation(){
   const message = document.getElementById('acMessage').value.trim();
   const newState = !currentActivation;
@@ -545,7 +737,69 @@ async function toggleActivation(){
     if(j.ok){ toast(newState?'⚡ Đã BẬT!':'✅ Đã TẮT + reset!','success'); loadServerStatus(); }
   } catch(e){ toast('❌ '+e.message,'error'); }
 }
-
+async function toggleAnnouncement(){
+  const content = document.getElementById('anContent').value.trim();
+  const newState = !currentAnnouncement;
+  if(newState && !content){ toast('⚠️ Nhập nội dung!','error'); return; }
+  try{
+    const j = await api('announcement', {enabled:newState, content});
+    if(j.ok){
+      toast(newState?'📢 Đã BẬT thông báo!':'✅ Đã TẮT thông báo!','success');
+      loadServerStatus();
+    }
+  } catch(e){ toast('❌ '+e.message,'error'); }
+}
+async function uploadTool(){
+  const version = document.getElementById('toolVersion').value.trim();
+  const code = document.getElementById('toolCode').value;
+  const note = document.getElementById('toolNote').value.trim();
+  if(!version){ toast('⚠️ Nhập version!','error'); return; }
+  if(!code || code.length < 5000){ toast('⚠️ Code quá ngắn!','error'); return; }
+  const size_kb = (code.length / 1024).toFixed(1);
+  if(!confirm(`Upload v${version} (${size_kb} KB)?`)) return;
+  try{
+    const j = await api('upload_tool', {version, code, note});
+    if(j.ok){
+      toast(`✅ Đã upload v${version}!`,'success');
+      document.getElementById('toolCode').value = '';
+      document.getElementById('toolNote').value = '';
+      loadToolHistory();
+    } else toast('❌ '+j.error,'error');
+  } catch(e){ toast('❌ '+e.message,'error'); }
+}
+async function loadToolHistory(){
+  try{
+    const j = await api('tool_history'); if(!j.ok) return;
+    const box = document.getElementById('toolHistory');
+    const pill = document.getElementById('toolPill');
+    if(!j.items.length){
+      box.innerHTML = '<div style="text-align:center;padding:10px;color:var(--gray)">📭 Chưa có version</div>';
+      pill.textContent = '—'; pill.className = 'status-pill off';
+      return;
+    }
+    const active = j.items.find(x => x.is_active);
+    if(active){ pill.textContent = 'v' + active.version; pill.className = 'status-pill on'; }
+    box.innerHTML = j.items.map(it=>{
+      const isActive = it.is_active ? '<span class="badge badge-active">✅ ACTIVE</span>' : '';
+      const size_kb = (it.size / 1024).toFixed(1);
+      const time = new Date(it.uploaded_at).toLocaleString('vi-VN');
+      return `<div class="key-item" style="padding:8px">
+        <div class="key-header" style="margin-bottom:4px">
+          <div><span class="badge badge-vip3">v${it.version}</span> ${isActive}</div>
+          <button class="btn btn-danger btn-small" onclick="deleteTool(${it.id})">🗑️</button>
+        </div>
+        <div style="font-size:11px;color:var(--gray)">📦 ${size_kb} KB | 🕐 ${time} | 📝 ${it.note || '-'}</div>
+      </div>`;
+    }).join('');
+  } catch(e){}
+}
+async function deleteTool(id){
+  if(!confirm('Xoá version này?')) return;
+  try{
+    const j = await api('delete_tool', {id});
+    if(j.ok){ toast('🗑️ Đã xoá!','success'); loadToolHistory(); }
+  } catch(e){}
+}
 async function createKey(){
   const type = document.getElementById('newType').value;
   const dh = parseInt(document.getElementById('newDuration').value);
@@ -561,7 +815,6 @@ async function createKey(){
 }
 function copyKey(){ if(lastKey) navigator.clipboard.writeText(lastKey).then(()=>toast('📋 Copy!','success')); }
 function hideNewKey(){ document.getElementById('newKeyResult').classList.add('hidden'); lastKey=null; }
-
 async function loadKeys(){
   try{
     const j = await api('list'); if(!j.ok) return;
@@ -576,7 +829,6 @@ function getKeyStatus(k){
 }
 function formatTime(ts){ return ts ? new Date(ts).toLocaleString('vi-VN',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '-'; }
 function formatDuration(ms){ if(ms<=0) return 'Hết'; const d=Math.floor(ms/86400000), h=Math.floor((ms%86400000)/3600000); return d>0?`${d}d ${h}h`:`${h}h`; }
-
 function renderKeys(){
   const box = document.getElementById('keysList');
   const ft = (document.getElementById('filterText').value||'').toLowerCase();
@@ -591,14 +843,14 @@ function renderKeys(){
     if(fs==='used' && !k.device_id) return false;
     return true;
   });
-  if(!list.length){ box.innerHTML='<div style="text-align:center;padding:30px;color:var(--gray)">📭 Không có key</div>'; return; }
+  if(!list.length){
+    box.innerHTML='<div style="text-align:center;padding:30px;color:var(--gray)">📭 Không có key</div>';
+    return;
+  }
   box.innerHTML = list.map(k=>{
     const st = getKeyStatus(k);
-    const sb = st==='active'?'<span class="badge badge-active">✅ ACTIVE</span>':
-              st==='expired'?'<span class="badge badge-expired">⏰ HẾT HẠN</span>':
-              '<span class="badge badge-revoked">❌ THU HỒI</span>';
-    const tb = {VIP1:'<span class="badge badge-vip1">🔓 VIP1</span>',VIP3:'<span class="badge badge-vip3">🔐 VIP3</span>',
-                SUPER:'<span class="badge badge-super">👑 SUPER</span>',ADMIN:'<span class="badge badge-admin">⚡ ADMIN</span>'}[k.type]||'';
+    const sb = st==='active'?'<span class="badge badge-active">✅ ACTIVE</span>':st==='expired'?'<span class="badge badge-expired">⏰ HẾT HẠN</span>':'<span class="badge badge-revoked">❌ THU HỒI</span>';
+    const tb = {VIP1:'<span class="badge badge-vip1">🔓 VIP1</span>',VIP3:'<span class="badge badge-vip3">🔐 VIP3</span>',SUPER:'<span class="badge badge-super">👑 SUPER</span>',ADMIN:'<span class="badge badge-admin">⚡ ADMIN</span>'}[k.type]||'';
     const remain = k.type==='ADMIN'?'VĨNH VIỄN':formatDuration(k.expires_at-now);
     const dev = k.device_id ? k.device_id.substring(0,16)+'...' : 'chưa dùng';
     return `<div class="key-item">
@@ -623,16 +875,11 @@ function renderKeys(){
   }).join('');
 }
 function copyAny(k){ navigator.clipboard.writeText(k).then(()=>toast('📋 Copy!','success')); }
-async function revokeKey(key){ const reason=prompt('Lý do?','Admin revoked'); if(reason===null) return;
-  const j=await api('revoke',{key,reason}); if(j.ok){ toast('🚫 Đã thu hồi','success'); loadKeys(); loadStats(); } }
+async function revokeKey(key){ const reason=prompt('Lý do?','Admin revoked'); if(reason===null) return; const j=await api('revoke',{key,reason}); if(j.ok){ toast('🚫 Đã thu hồi','success'); loadKeys(); loadStats(); } }
 async function reactivateKey(key){ const j=await api('reactivate',{key}); if(j.ok){ toast('✅ Đã bật lại','success'); loadKeys(); loadStats(); } }
-async function resetDevice(key){ if(!confirm('Reset device?')) return;
-  const j=await api('reset_device',{key}); if(j.ok){ toast('📱 Đã reset','success'); loadKeys(); } }
-async function extendKey(key){ const h=prompt('Gia hạn bao nhiêu giờ?','24'); if(!h) return;
-  const j=await api('extend',{key,hours:parseInt(h)}); if(j.ok){ toast('➕ Đã gia hạn','success'); loadKeys(); loadStats(); } }
-async function deleteKey(key){ if(!confirm('XOÁ VĨNH VIỄN?')) return;
-  const j=await api('delete',{key}); if(j.ok){ toast('🗑️ Đã xoá','success'); loadKeys(); loadStats(); } }
-
+async function resetDevice(key){ if(!confirm('Reset device?')) return; const j=await api('reset_device',{key}); if(j.ok){ toast('📱 Đã reset','success'); loadKeys(); } }
+async function extendKey(key){ const h=prompt('Gia hạn bao nhiêu giờ?','24'); if(!h) return; const j=await api('extend',{key,hours:parseInt(h)}); if(j.ok){ toast('➕ Đã gia hạn','success'); loadKeys(); loadStats(); } }
+async function deleteKey(key){ if(!confirm('XOÁ VĨNH VIỄN?')) return; const j=await api('delete',{key}); if(j.ok){ toast('🗑️ Đã xoá','success'); loadKeys(); loadStats(); } }
 async function loadStats(){
   const j = await api('stats'); if(!j.ok) return;
   document.getElementById('statTotal').textContent = j.stats.total;
@@ -646,14 +893,14 @@ async function loadLogs(){
   if(!j.logs.length){ box.innerHTML='<div style="text-align:center;padding:20px;color:var(--gray)">📭 Chưa có log</div>'; return; }
   box.innerHTML = j.logs.map(l=>{
     const time = new Date(l.ts).toLocaleString('vi-VN');
-    const color = {create:'var(--green)',validate_ok:'var(--cyan)',bind_device:'var(--yellow)',revoke:'var(--red)',delete:'var(--red)',extend:'var(--green)',maintenance_on:'var(--red)',maintenance_off:'var(--green)',activation_on:'var(--yellow)',activation_off:'var(--green)'}[l.action]||'var(--white)';
+    const color = {create:'var(--green)',validate_ok:'var(--cyan)',bind_device:'var(--yellow)',revoke:'var(--red)',delete:'var(--red)',extend:'var(--green)',maintenance_on:'var(--red)',maintenance_off:'var(--green)',activation_on:'var(--yellow)',activation_off:'var(--green)',announcement_on:'var(--yellow)',announcement_off:'var(--green)',tool_upload:'var(--cyan)',tool_delete:'var(--red)'}[l.action]||'var(--white)';
     return `<div style="padding:8px;border-bottom:1px solid rgba(0,212,255,0.1);font-size:12px">
       <span style="color:${color};font-weight:700">${l.action}</span>
       <span style="color:var(--gray);margin-left:8px">${time}</span>
-      <div style="color:var(--cyan);font-family:monospace;margin-top:4px;word-break:break-all">${l.key||''}</div></div>`;
+      <div style="color:var(--cyan);font-family:monospace;margin-top:4px;word-break:break-all">${l.key||''}</div>
+    </div>`;
   }).join('');
 }
-
 (function init(){
   const saved = sessionStorage.getItem('lptool_secret');
   if(saved){ adminSecret = saved; showMain(); }
