@@ -2,7 +2,7 @@
 # ==============================================================
 # LP-TOOL KEY SERVER — Render.com Edition
 # Admin: Thiên Phú - Minh Lâm
-# Đầy đủ: Bảo trì + Kích hoạt + Key + Active + Export + Batch + Timer-from-first-use
+# Có thêm: Sinh Key FREE (admin test, không qua Link4m)
 # ==============================================================
 
 from __future__ import annotations
@@ -11,11 +11,13 @@ import os
 import sqlite3
 import time
 import random
+import string
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
+from typing import Any, Dict, Optional, Tuple
 
-from flask import Flask, request, jsonify, render_template_string, Response
+from flask import Flask, request, jsonify, render_template_string, send_from_directory
 
 # ==============================================================
 # CONFIG
@@ -27,27 +29,11 @@ DB_PATH = os.environ.get("DB_PATH", "keys.db")
 app = Flask(__name__)
 
 # ==============================================================
-# STATE — Bảo trì + Kích hoạt (RAM)
-# ==============================================================
-
-MAINTENANCE = {
-    "enabled": False,
-    "content": "",
-    "enabled_at": None,
-}
-ACTIVATION = {
-    "required": False,
-    "activated": False,
-    "message": "Vui lòng nhấn KÍCH HOẠT để bắt đầu sử dụng tool",
-    "activated_at": None,
-    "activated_by": None,
-}
-
-# ==============================================================
 # DATABASE
 # ==============================================================
 
 def init_db():
+    """Khởi tạo database."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -58,7 +44,7 @@ def init_db():
             duration_hours INTEGER NOT NULL,
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
-            active INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1,
             created_by TEXT,
             note TEXT,
             device_id TEXT,
@@ -83,7 +69,6 @@ def init_db():
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_keys_device ON keys(device_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_keys_active ON keys(active)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_logs_key ON logs(key)")
     conn.commit()
     conn.close()
@@ -95,7 +80,8 @@ def get_db():
     return conn
 
 
-def log_action(key, action, device_id=None, ip=None, info=None):
+def log_action(key: str, action: str, device_id: str = None,
+               ip: str = None, info: dict = None):
     try:
         conn = get_db()
         c = conn.cursor()
@@ -114,12 +100,15 @@ def log_action(key, action, device_id=None, ip=None, info=None):
 # ==============================================================
 
 CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+FREE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # không có I, L, O, 0, 1
 
-def rand_str(n):
+def rand_str(n: int) -> str:
     return "".join(random.choice(CHARS) for _ in range(n))
 
+def gen_free_key() -> str:
+    return "".join(random.choice(FREE_CHARS) for _ in range(7))
 
-def generate_key(key_type):
+def generate_key(key_type: str) -> str:
     if key_type == "VIP1":
         return f"LPTOOL_VIP1_{rand_str(5)}_{rand_str(4)}_{rand_str(4)}"
     if key_type == "VIP3":
@@ -129,11 +118,13 @@ def generate_key(key_type):
     if key_type == "ADMIN":
         return (f"LPTOOL_ADMIN_{rand_str(6)}_{rand_str(7)}_{rand_str(3)}_{rand_str(5)}_"
                 f"{rand_str(3)}_{rand_str(3)}_{rand_str(5)}_{rand_str(4)}_{rand_str(4)}_{rand_str(6)}")
+    if key_type == "FREE":
+        return gen_free_key()
     raise ValueError("Invalid key type")
 
 
 # ==============================================================
-# ADMIN AUTH
+# ADMIN AUTH DECORATOR
 # ==============================================================
 
 def require_admin(f):
@@ -148,63 +139,7 @@ def require_admin(f):
 
 
 # ==============================================================
-# API: CHECK STATUS — Tool gọi định kỳ
-# ==============================================================
-
-@app.route("/api/check_status", methods=["GET", "POST", "OPTIONS"])
-def api_check_status():
-    if request.method == "OPTIONS":
-        return "", 200
-    return jsonify({
-        "ok": True,
-        "maintenance": MAINTENANCE["enabled"],
-        "maintenance_content": MAINTENANCE["content"],
-        "need_activation": ACTIVATION["required"],
-        "activated": ACTIVATION["activated"],
-        "activation_message": ACTIVATION["message"],
-        "ts": int(time.time() * 1000),
-    })
-
-
-# ==============================================================
-# API: ACTIVATE — User nhấn ENTER
-# ==============================================================
-
-@app.route("/api/activate", methods=["POST", "OPTIONS"])
-def api_activate():
-    if request.method == "OPTIONS":
-        return "", 200
-    data = request.get_json(silent=True) or {}
-    key_str = (data.get("key") or "").strip()
-    device_id = (data.get("device_id") or "").strip()
-
-    if not key_str:
-        return jsonify({"ok": False, "error": "Thiếu key"}), 400
-
-    conn = get_db()
-    c = conn.cursor()
-    row = c.execute("SELECT * FROM keys WHERE key=?", (key_str,)).fetchone()
-    conn.close()
-    if not row:
-        return jsonify({"ok": False, "error": "Key không tồn tại"}), 404
-
-    if not ACTIVATION["required"]:
-        return jsonify({"ok": True, "message": "Không cần kích hoạt", "skip": True})
-
-    ACTIVATION["activated"] = True
-    ACTIVATION["activated_at"] = int(time.time() * 1000)
-    ACTIVATION["activated_by"] = key_str
-    log_action(key_str, "activation_confirmed", device_id)
-
-    return jsonify({
-        "ok": True,
-        "message": "✅ Kích hoạt thành công!",
-        "activated_at": ACTIVATION["activated_at"],
-    })
-
-
-# ==============================================================
-# API: VALIDATE — Timer bắt đầu từ lúc user nhập lần đầu
+# API: VALIDATE (Tool gọi)
 # ==============================================================
 
 @app.route("/api/validate", methods=["POST", "OPTIONS"])
@@ -232,45 +167,15 @@ def api_validate():
     row = dict(row)
     now_ms = int(time.time() * 1000)
 
-    # ⚡ Check Active
-    if row["active"] != 1:
-        log_action(key_str, "validate_failed_not_active", device_id, ip)
+    if not row["active"]:
+        log_action(key_str, "validate_failed_inactive", device_id, ip)
         conn.close()
         return jsonify({
             "ok": False,
-            "error": "Key chưa Active, Vui lòng báo Admin",
-            "need_activation": True
+            "error": "Key đã bị thu hồi",
+            "reason": row.get("banned_reason") or "Admin revoked"
         }), 403
 
-    # ⚡ Key chưa dùng lần nào → tính hạn từ bây giờ
-    if not row["first_used_at"]:
-        new_expires = now_ms + int(row["duration_hours"]) * 3600 * 1000
-        c.execute("""
-            UPDATE keys SET
-                first_used_at = ?,
-                expires_at = ?,
-                device_id = ?,
-                device_fingerprint = ?,
-                last_seen = ?,
-                last_ip = ?,
-                use_count = 1
-            WHERE id = ?
-        """, (now_ms, new_expires, device_id, fingerprint, now_ms, ip, row["id"]))
-        conn.commit()
-        log_action(key_str, "first_use_start_timer", device_id, ip,
-                   {"duration_hours": row["duration_hours"], "expires_at": new_expires})
-        conn.close()
-        return jsonify({
-            "ok": True,
-            "key_type": row["type"],
-            "duration_hours": row["duration_hours"],
-            "expires_at": new_expires,
-            "is_admin": row["type"] == "ADMIN",
-            "created_by": row["created_by"],
-            "message": "Kích hoạt lần đầu thành công — bắt đầu tính hạn"
-        })
-
-    # ⚡ Đã dùng → check hết hạn
     if row["expires_at"] < now_ms and row["type"] != "ADMIN":
         log_action(key_str, "validate_failed_expired", device_id, ip)
         conn.close()
@@ -280,14 +185,13 @@ def api_validate():
             "expired_at": row["expires_at"]
         }), 403
 
-    # ⚡ Check device
     if not row["device_id"]:
         c.execute("""
-            UPDATE keys SET device_id=?, device_fingerprint=?, last_seen=?, last_ip=?,
-                            use_count = use_count + 1
+            UPDATE keys SET device_id=?, device_fingerprint=?, first_used_at=?,
+                            last_seen=?, last_ip=?, use_count=1
             WHERE id=?
-        """, (device_id, fingerprint, now_ms, ip, row["id"]))
-        log_action(key_str, "bind_device", device_id, ip)
+        """, (device_id, fingerprint, now_ms, now_ms, ip, row["id"]))
+        log_action(key_str, "bind_device", device_id, ip, {"fingerprint": fingerprint})
     elif row["device_id"] != device_id:
         log_action(key_str, "validate_failed_wrong_device", device_id, ip,
                    {"bound_device": row["device_id"]})
@@ -299,7 +203,7 @@ def api_validate():
         }), 403
     else:
         c.execute("""
-            UPDATE keys SET last_seen=?, last_ip=?, use_count = use_count + 1
+            UPDATE keys SET last_seen=?, last_ip=?, use_count=use_count+1
             WHERE id=?
         """, (now_ms, ip, row["id"]))
 
@@ -313,13 +217,14 @@ def api_validate():
         "duration_hours": row["duration_hours"],
         "expires_at": row["expires_at"],
         "is_admin": row["type"] == "ADMIN",
+        "is_free": row["type"] == "FREE",
         "created_by": row["created_by"],
         "message": "Xác thực thành công"
     })
 
 
 # ==============================================================
-# API: HEARTBEAT
+# API: HEARTBEAT (Tool gửi mỗi 60s)
 # ==============================================================
 
 @app.route("/api/heartbeat", methods=["POST", "OPTIONS"])
@@ -345,9 +250,9 @@ def api_heartbeat():
     row = dict(row)
     now_ms = int(time.time() * 1000)
 
-    if row["active"] != 1:
+    if not row["active"]:
         conn.close()
-        return jsonify({"ok": False, "error": "Key chưa Active, Vui lòng báo Admin"}), 403
+        return jsonify({"ok": False, "error": "Key đã bị thu hồi"}), 403
 
     if row["expires_at"] < now_ms and row["type"] != "ADMIN":
         conn.close()
@@ -381,17 +286,12 @@ def api_admin():
     conn = get_db()
     c = conn.cursor()
 
-    # ============ CREATE (mặc định active=0, expires=0) ============
+    # ============ CREATE ============
     if action == "create":
         key_type = data.get("type", "VIP1")
         duration_hours = int(data.get("duration_hours", 24))
         note = data.get("note", "")
         created_by = data.get("created_by", "admin")
-        try:
-            quantity = int(data.get("quantity", 1))
-        except Exception:
-            quantity = 1
-        quantity = max(1, min(quantity, 100))
 
         if key_type not in ("VIP1", "VIP3", "SUPER", "ADMIN"):
             conn.close()
@@ -400,12 +300,53 @@ def api_admin():
         if key_type == "ADMIN":
             duration_hours = 36700 * 24
 
+        key_str = generate_key(key_type)
         now_ms = int(time.time() * 1000)
+        expires_at = now_ms + duration_hours * 3600 * 1000
 
-        created_keys = []
+        c.execute("""
+            INSERT INTO keys (key, type, duration_hours, created_at, expires_at,
+                              active, created_by, note)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        """, (key_str, key_type, duration_hours, now_ms, expires_at, created_by, note))
+        conn.commit()
+        log_action(key_str, "create", None, None,
+                   {"type": key_type, "duration": duration_hours, "created_by": created_by})
+        conn.close()
+
+        return jsonify({
+            "ok": True,
+            "key": key_str,
+            "info": {
+                "key": key_str,
+                "type": key_type,
+                "duration_hours": duration_hours,
+                "created_at": now_ms,
+                "expires_at": expires_at,
+                "active": True,
+                "created_by": created_by,
+                "note": note,
+            }
+        })
+
+    # ============ GEN FREE KEY ============
+    if action == "gen_free_key":
+        try:
+            duration_hours = int(data.get("duration_hours", 24))
+        except Exception:
+            duration_hours = 24
+        duration_hours = max(1, min(duration_hours, 720))  # 1h - 30 ngày
+        note = data.get("note", "")
+        quantity = int(data.get("quantity", 1))
+        quantity = max(1, min(quantity, 100))
+
+        now_ms = int(time.time() * 1000)
+        expires_at = now_ms + duration_hours * 3600 * 1000
+
+        created = []
         for _ in range(quantity):
             for _attempt in range(10):
-                key_str = generate_key(key_type)
+                key_str = gen_free_key()
                 exists = c.execute("SELECT 1 FROM keys WHERE key=?", (key_str,)).fetchone()
                 if not exists:
                     break
@@ -413,32 +354,24 @@ def api_admin():
                 c.execute("""
                     INSERT INTO keys (key, type, duration_hours, created_at, expires_at,
                                       active, created_by, note)
-                    VALUES (?, ?, ?, ?, 0, 0, ?, ?)
-                """, (key_str, key_type, duration_hours, now_ms, created_by, note))
-                created_keys.append(key_str)
+                    VALUES (?, 'FREE', ?, ?, ?, 1, 'admin', ?)
+                """, (key_str, duration_hours, now_ms, expires_at, note))
+                created.append(key_str)
             except sqlite3.IntegrityError:
                 continue
 
         conn.commit()
-        for k in created_keys:
-            log_action(k, "create", None, None,
-                       {"type": key_type, "duration": duration_hours,
-                        "created_by": created_by, "batch": quantity})
-
+        for k in created:
+            log_action(k, "gen_free_key", None, None,
+                       {"duration": duration_hours, "quantity": quantity})
         conn.close()
+
         return jsonify({
             "ok": True,
-            "keys": created_keys,
-            "quantity": len(created_keys),
-            "info": {
-                "type": key_type,
-                "duration_hours": duration_hours,
-                "created_at": now_ms,
-                "expires_at": 0,
-                "active": 0,
-                "created_by": created_by,
-                "note": note,
-            }
+            "keys": created,
+            "quantity": len(created),
+            "duration_hours": duration_hours,
+            "expires_at": expires_at,
         })
 
     # ============ LIST ============
@@ -448,45 +381,24 @@ def api_admin():
         conn.close()
         return jsonify({"ok": True, "keys": keys, "total": len(keys)})
 
-    # ============ SET ACTIVE ============
-    if action == "set_active":
+    # ============ REVOKE ============
+    if action == "revoke":
         key_str = data.get("key")
-        try:
-            value = int(data.get("value", 1))
-        except Exception:
-            conn.close()
-            return jsonify({"ok": False, "error": "value không hợp lệ"}), 400
-        value = 1 if value else 0
-
-        row = c.execute("SELECT * FROM keys WHERE key=?", (key_str,)).fetchone()
-        if not row:
-            conn.close()
-            return jsonify({"ok": False, "error": "Key không tồn tại"}), 404
-
-        c.execute("UPDATE keys SET active=? WHERE key=?", (value, key_str))
+        reason = data.get("reason", "Admin revoked")
+        c.execute("UPDATE keys SET active=0, banned_reason=? WHERE key=?", (reason, key_str))
         conn.commit()
-        log_action(key_str, "set_active", None, None, {"value": value})
+        log_action(key_str, "revoke", None, None, {"reason": reason})
         conn.close()
-        msg = "✅ Đã bật Active" if value == 1 else "⏸️ Đã tắt Active"
-        return jsonify({"ok": True, "message": msg, "active": value})
+        return jsonify({"ok": True, "message": "Đã thu hồi key"})
 
-    # ============ BULK ACTIVE ============
-    if action == "bulk_active":
-        keys = data.get("keys") or []
-        try:
-            value = 1 if int(data.get("value", 1)) else 0
-        except Exception:
-            value = 1
-        if not isinstance(keys, list) or not keys:
-            conn.close()
-            return jsonify({"ok": False, "error": "Thiếu danh sách key"}), 400
-
-        for k in keys:
-            c.execute("UPDATE keys SET active=? WHERE key=?", (value, k))
-            log_action(k, "set_active_bulk", None, None, {"value": value})
+    # ============ REACTIVATE ============
+    if action == "reactivate":
+        key_str = data.get("key")
+        c.execute("UPDATE keys SET active=1, banned_reason=NULL WHERE key=?", (key_str,))
         conn.commit()
+        log_action(key_str, "reactivate")
         conn.close()
-        return jsonify({"ok": True, "count": len(keys), "active": value})
+        return jsonify({"ok": True, "message": "Đã kích hoạt lại"})
 
     # ============ DELETE ============
     if action == "delete":
@@ -497,18 +409,17 @@ def api_admin():
         conn.close()
         return jsonify({"ok": True, "message": "Đã xoá key"})
 
-    # ============ RESET DEVICE + RESET TIMER ============
+    # ============ RESET DEVICE ============
     if action == "reset_device":
         key_str = data.get("key")
         c.execute("""
-            UPDATE keys SET device_id=NULL, device_fingerprint=NULL,
-                            first_used_at=NULL, expires_at=0
+            UPDATE keys SET device_id=NULL, device_fingerprint=NULL, first_used_at=NULL
             WHERE key=?
         """, (key_str,))
         conn.commit()
         log_action(key_str, "reset_device")
         conn.close()
-        return jsonify({"ok": True, "message": "Đã reset device và hạn"})
+        return jsonify({"ok": True, "message": "Đã reset device"})
 
     # ============ EXTEND ============
     if action == "extend":
@@ -520,7 +431,7 @@ def api_admin():
             return jsonify({"ok": False, "error": "Key không tồn tại"}), 404
         row = dict(row)
         now_ms = int(time.time() * 1000)
-        base = max(row["expires_at"] or 0, now_ms)
+        base = max(row["expires_at"], now_ms)
         new_exp = base + hours * 3600 * 1000
         c.execute("""
             UPDATE keys SET expires_at=?, active=1, duration_hours=duration_hours+?
@@ -531,66 +442,30 @@ def api_admin():
         conn.close()
         return jsonify({"ok": True, "message": "Đã gia hạn", "expires_at": new_exp})
 
-    # ============ MAINTENANCE ============
-    if action == "maintenance":
-        enabled = bool(data.get("enabled", False))
-        content = str(data.get("content", "")).strip()
-        MAINTENANCE["enabled"] = enabled
-        MAINTENANCE["content"] = content
-        MAINTENANCE["enabled_at"] = int(time.time() * 1000) if enabled else None
-        conn.close()
-        log_action(None, "maintenance_" + ("on" if enabled else "off"),
-                   None, None, {"content": content})
-        return jsonify({"ok": True, "maintenance": MAINTENANCE})
-
-    # ============ ACTIVATION ============
-    if action == "activation":
-        required = bool(data.get("required", False))
-        message = str(data.get("message", "")).strip()
-        reset = bool(data.get("reset", False))
-        ACTIVATION["required"] = required
-        if message:
-            ACTIVATION["message"] = message
-        if reset or not required:
-            ACTIVATION["activated"] = False
-            ACTIVATION["activated_at"] = None
-            ACTIVATION["activated_by"] = None
-        conn.close()
-        log_action(None, "activation_" + ("on" if required else "off"),
-                   None, None, {"msg": message})
-        return jsonify({"ok": True, "activation": ACTIVATION})
-
-    # ============ GET STATUS ============
-    if action == "get_status":
-        conn.close()
-        return jsonify({
-            "ok": True,
-            "maintenance": MAINTENANCE,
-            "activation": ACTIVATION,
-        })
-
     # ============ STATS ============
     if action == "stats":
         total = c.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
         now_ms = int(time.time() * 1000)
-        used = c.execute("SELECT COUNT(*) FROM keys WHERE first_used_at IS NOT NULL").fetchone()[0]
-        not_active = c.execute("SELECT COUNT(*) FROM keys WHERE active=0").fetchone()[0]
-        active = c.execute("SELECT COUNT(*) FROM keys WHERE active=1").fetchone()[0]
-        running = c.execute("""
+        active = c.execute("""
             SELECT COUNT(*) FROM keys
-            WHERE active=1 AND first_used_at IS NOT NULL AND (expires_at > ? OR type='ADMIN')
+            WHERE active=1 AND (expires_at > ? OR type='ADMIN')
+        """, (now_ms,)).fetchone()[0]
+        used = c.execute("SELECT COUNT(*) FROM keys WHERE device_id IS NOT NULL").fetchone()[0]
+        revoked = c.execute("SELECT COUNT(*) FROM keys WHERE active=0").fetchone()[0]
+        expired = c.execute("""
+            SELECT COUNT(*) FROM keys WHERE expires_at < ? AND type != 'ADMIN'
         """, (now_ms,)).fetchone()[0]
 
         by_type = {}
-        for t in ("VIP1", "VIP3", "SUPER", "ADMIN"):
+        for t in ("VIP1", "VIP3", "SUPER", "ADMIN", "FREE"):
             by_type[t] = c.execute("SELECT COUNT(*) FROM keys WHERE type=?", (t,)).fetchone()[0]
 
         conn.close()
         return jsonify({
             "ok": True,
             "stats": {
-                "total": total, "active": active, "notActive": not_active,
-                "used": used, "running": running, "byType": by_type
+                "total": total, "active": active, "used": used,
+                "revoked": revoked, "expired": expired, "byType": by_type
             }
         })
 
@@ -609,55 +484,12 @@ def api_admin():
         conn.close()
         return jsonify({"ok": True, "logs": logs})
 
-    # ============ EXPORT ============
-    if action == "export":
-        mode = (data.get("mode") or "all").strip().lower()
-        filename = (data.get("filename") or "").strip()
-        if not filename:
-            filename = f"keys_{mode}_{int(time.time())}.txt"
-        if not filename.endswith(".txt"):
-            filename += ".txt"
-
-        if mode == "active":
-            rows = c.execute("SELECT key, type, expires_at, first_used_at FROM keys WHERE active=1 ORDER BY created_at DESC").fetchall()
-        elif mode == "not_active":
-            rows = c.execute("SELECT key, type, expires_at, first_used_at FROM keys WHERE active=0 ORDER BY created_at DESC").fetchall()
-        else:
-            rows = c.execute("SELECT key, type, expires_at, first_used_at FROM keys ORDER BY created_at DESC").fetchall()
-
-        conn.close()
-
-        lines = []
-        for r in rows:
-            r = dict(r)
-            exp = r["expires_at"] or 0
-            if r["type"] == "ADMIN":
-                exp_str = "NEVER"
-            elif exp == 0:
-                exp_str = "NOT_STARTED"
-            else:
-                exp_str = datetime.fromtimestamp(exp / 1000).strftime("%Y-%m-%d %H:%M:%S")
-            lines.append(f"{r['key']} | {r['type']} | EXP: {exp_str}")
-
-        content = "\n".join(lines)
-        log_action(None, "export", None, None, {"mode": mode, "filename": filename, "count": len(lines)})
-
-        return Response(
-            content,
-            mimetype="text/plain",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "X-Filename": filename,
-                "X-Count": str(len(lines)),
-            }
-        )
-
     conn.close()
     return jsonify({"ok": False, "error": "Action không hợp lệ"}), 400
 
 
 # ==============================================================
-# ADMIN HTML
+# ADMIN WEB UI
 # ==============================================================
 
 ADMIN_HTML = r"""
@@ -670,30 +502,33 @@ ADMIN_HTML = r"""
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Roboto, sans-serif; }
   :root {
-    --cyan:#00d4ff; --blue:#2563eb; --blue-light:#60a5fa;
-    --green:#00e676; --yellow:#ffd740; --red:#ff4d6d; --gray:#7a8ca3; --white:#eaf2ff;
+    --cyan: #00d4ff; --blue: #2563eb; --blue-light: #60a5fa;
+    --green: #00e676; --yellow: #ffd740; --red: #ff4d6d;
+    --purple: #a855f7; --gray: #7a8ca3; --white: #eaf2ff;
   }
-  body { background: radial-gradient(ellipse at top,#0a1a3a 0%,#050a14 60%);
+  body { background: radial-gradient(ellipse at top, #0a1a3a 0%, #050a14 60%);
          color: var(--white); min-height: 100vh; padding: 20px; }
   .container { max-width: 1200px; margin: 0 auto; }
   .header { text-align: center; margin-bottom: 24px; }
   .logo { font-size: 38px; font-weight: 900;
-    background: linear-gradient(135deg,var(--cyan),var(--blue-light),var(--cyan));
+    background: linear-gradient(135deg, var(--cyan), var(--blue-light), var(--cyan));
     -webkit-background-clip: text; -webkit-text-fill-color: transparent; letter-spacing: 4px; }
   .subtitle { color: var(--gray); font-size: 12px; letter-spacing: 2px; text-transform: uppercase; }
-  .card { background: linear-gradient(145deg,rgba(11,26,51,0.85),rgba(5,10,20,0.95));
-          border: 1px solid rgba(0,212,255,0.25); border-radius: 16px;
-          padding: 24px; margin-bottom: 20px; box-shadow: 0 8px 40px rgba(0,0,0,0.5); }
+  .card { background: linear-gradient(145deg, rgba(11,26,51,0.85), rgba(5,10,20,0.95));
+    border: 1px solid rgba(0,212,255,0.25); border-radius: 16px;
+    padding: 24px; margin-bottom: 20px; box-shadow: 0 8px 40px rgba(0,0,0,0.5); }
+  .card.card-free { border-color: rgba(168,85,247,0.35); }
   .card-title { font-size: 16px; color: var(--cyan); margin-bottom: 16px;
     padding-bottom: 10px; border-bottom: 1px solid rgba(0,212,255,0.15);
     letter-spacing: 1px; display: flex; align-items: center; gap: 8px; }
+  .card.card-free .card-title { color: var(--purple); border-bottom-color: rgba(168,85,247,0.2); }
   label { display: block; color: var(--gray); font-size: 11px; margin-bottom: 6px;
     text-transform: uppercase; font-weight: 600; }
   input, select, textarea { width: 100%; padding: 12px 14px;
     background: rgba(5,10,20,0.8); border: 1px solid rgba(0,212,255,0.25);
     border-radius: 8px; color: var(--white); font-size: 14px; outline: none;
     font-family: 'Consolas', monospace; }
-  input:focus, select:focus, textarea:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(0,212,255,0.15); }
+  input:focus, select:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(0,212,255,0.15); }
   .grid { display: grid; gap: 12px; }
   .grid-4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
   .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
@@ -703,35 +538,33 @@ ADMIN_HTML = r"""
   .btn { padding: 12px 20px; border: none; border-radius: 8px;
     font-size: 14px; font-weight: 700; letter-spacing: 1px;
     cursor: pointer; transition: all 0.2s; text-transform: uppercase; }
-  .btn-primary { background: linear-gradient(135deg,var(--cyan),var(--blue)); color: #050a14; }
+  .btn-primary { background: linear-gradient(135deg, var(--cyan), var(--blue)); color: #050a14; }
   .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,212,255,0.55); }
-  .btn-danger { background: linear-gradient(135deg,var(--red),#b91c3c); color: white; }
-  .btn-warn { background: linear-gradient(135deg,var(--yellow),#f59e0b); color: #050a14; }
-  .btn-green { background: linear-gradient(135deg,var(--green),#00b050); color: #050a14; }
+  .btn-danger { background: linear-gradient(135deg, var(--red), #b91c3c); color: white; }
+  .btn-warn { background: linear-gradient(135deg, var(--yellow), #f59e0b); color: #050a14; }
+  .btn-purple { background: linear-gradient(135deg, var(--purple), #7c3aed); color: white; }
+  .btn-purple:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(168,85,247,0.55); }
   .btn-small { padding: 6px 12px; font-size: 11px; }
   .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
   .key-item { background: rgba(5,10,20,0.6); border: 1px solid rgba(0,212,255,0.15);
     border-radius: 10px; padding: 12px; margin-bottom: 8px; }
-  .key-item.not-active { border-color: rgba(255,77,109,0.35); }
-  .key-item.running { border-color: rgba(0,230,118,0.35); }
+  .key-item.free { border-color: rgba(168,85,247,0.3); }
   .key-header { display: flex; justify-content: space-between; align-items: center;
     margin-bottom: 8px; flex-wrap: wrap; gap: 6px; }
-  .badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 700;
-    display: inline-block; }
+  .badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; }
   .badge-vip1 { background: rgba(0,230,118,0.15); color: var(--green); }
   .badge-vip3 { background: rgba(96,165,250,0.15); color: var(--blue-light); }
   .badge-super { background: rgba(255,215,64,0.15); color: var(--yellow); }
   .badge-admin { background: rgba(255,77,109,0.15); color: var(--red); }
-  .badge-running { background: rgba(0,230,118,0.2); color: var(--green); }
-  .badge-active { background: rgba(0,212,255,0.15); color: var(--cyan); }
-  .badge-not-active { background: rgba(255,77,109,0.15); color: var(--red); }
+  .badge-free  { background: rgba(168,85,247,0.2); color: var(--purple); }
+  .badge-active { background: rgba(0,230,118,0.15); color: var(--green); }
+  .badge-revoked { background: rgba(255,77,109,0.15); color: var(--red); }
   .badge-expired { background: rgba(122,140,163,0.15); color: var(--gray); }
-  .badge-on { background: rgba(255,77,109,0.2); color: var(--red); }
-  .badge-off { background: rgba(0,230,118,0.2); color: var(--green); }
   .key-value { font-family: 'Consolas', monospace; font-size: 12px;
     color: var(--cyan); background: rgba(0,0,0,0.4);
     padding: 8px 10px; border-radius: 6px;
     word-break: break-all; user-select: all; margin: 6px 0; }
+  .key-item.free .key-value { color: var(--purple); }
   .key-meta { display: flex; gap: 12px; font-size: 11px; color: var(--gray); flex-wrap: wrap; margin-top: 6px; }
   .key-meta span { color: var(--white); font-weight: 600; }
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
@@ -745,17 +578,20 @@ ADMIN_HTML = r"""
     z-index: 9999; opacity: 0; transform: translateX(100%);
     transition: all 0.3s; max-width: 320px; }
   .toast.show { opacity: 1; transform: translateX(0); }
-  .toast-success { background: linear-gradient(135deg,#00e676,#00b050); color: #050a14; }
-  .toast-error { background: linear-gradient(135deg,#ff4d6d,#b91c3c); color: white; }
+  .toast-success { background: linear-gradient(135deg, #00e676, #00b050); color: #050a14; }
+  .toast-error { background: linear-gradient(135deg, #ff4d6d, #b91c3c); color: white; }
+  .toast-info { background: linear-gradient(135deg, #00d4ff, #2563eb); color: #050a14; }
   .login-screen { display: flex; align-items: center; justify-content: center; min-height: 70vh; }
   .login-card { max-width: 400px; width: 100%; }
   .hidden { display: none !important; }
   .mt-10 { margin-top: 10px; }
   .filter-row { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
-  .keys-created-list { background: rgba(0,0,0,0.4); border-radius: 8px; padding: 10px;
+  .keys-created-list {
+    background: rgba(0,0,0,0.4); border-radius: 8px; padding: 10px;
     max-height: 240px; overflow-y: auto; margin-top: 8px;
-    font-family: 'Consolas', monospace; font-size: 12px; color: var(--cyan); }
-  .keys-created-list div { padding: 3px 0; border-bottom: 1px dashed rgba(0,212,255,0.15); user-select: all; }
+    font-family: 'Consolas', monospace; font-size: 12px; color: var(--purple);
+  }
+  .keys-created-list div { padding: 3px 0; border-bottom: 1px dashed rgba(168,85,247,0.2); user-select: all; }
 </style>
 </head>
 <body>
@@ -780,50 +616,22 @@ ADMIN_HTML = r"""
   <div id="mainPanel" class="hidden">
     <div class="header">
       <div class="logo">LP KEY ADMIN</div>
-      <div class="subtitle">⚡ QUẢN LÝ KEY + BẢO TRÌ + KÍCH HOẠT ⚡</div>
+      <div class="subtitle">⚡ RENDER + SQLITE ⚡</div>
     </div>
 
-    <!-- STATS -->
     <div class="card">
       <div class="card-title">📊 THỐNG KÊ</div>
       <div class="stats">
         <div class="stat-item"><div class="stat-value" id="statTotal">-</div><div class="stat-label">Tổng key</div></div>
-        <div class="stat-item"><div class="stat-value" id="statActive" style="color:var(--cyan)">-</div><div class="stat-label">Đã Active</div></div>
-        <div class="stat-item"><div class="stat-value" id="statRunning" style="color:var(--green)">-</div><div class="stat-label">Đang dùng</div></div>
-        <div class="stat-item"><div class="stat-value" id="statNotActive" style="color:var(--yellow)">-</div><div class="stat-label">Chưa Active</div></div>
+        <div class="stat-item"><div class="stat-value" id="statActive" style="color:var(--green)">-</div><div class="stat-label">Hoạt động</div></div>
+        <div class="stat-item"><div class="stat-value" id="statUsed" style="color:var(--cyan)">-</div><div class="stat-label">Đã kích hoạt</div></div>
+        <div class="stat-item"><div class="stat-value" id="statRevoked" style="color:var(--red)">-</div><div class="stat-label">Đã thu hồi</div></div>
       </div>
     </div>
 
-    <!-- BẢO TRÌ -->
-    <div class="card">
-      <div class="card-title">🔧 BẢO TRÌ <span id="mtPill" class="badge badge-off">OFF</span></div>
-      <div>
-        <label>Nội dung thông báo</label>
-        <textarea id="mtContent" rows="3" placeholder="Server đang nâng cấp, quay lại sau..."></textarea>
-      </div>
-      <button class="btn btn-warn mt-10" id="mtBtn" style="width:100%" onclick="toggleMaintenance()">🔧 BẬT BẢO TRÌ</button>
-      <div class="mt-10" style="font-size:11px; color:var(--gray);">
-        💡 Bật bảo trì → tất cả tool đang chạy sẽ hiện thông báo và tự thoát (trừ tool bật treo 24/7).
-      </div>
-    </div>
-
-    <!-- KÍCH HOẠT -->
-    <div class="card">
-      <div class="card-title">⚡ YÊU CẦU KÍCH HOẠT <span id="acPill" class="badge badge-off">OFF</span></div>
-      <div>
-        <label>Nội dung yêu cầu user</label>
-        <input type="text" id="acMessage" value="Vui lòng nhấn KÍCH HOẠT để bắt đầu sử dụng tool">
-      </div>
-      <button class="btn btn-warn mt-10" id="acBtn" style="width:100%" onclick="toggleActivation()">⚡ BẬT YÊU CẦU KÍCH HOẠT</button>
-      <div class="mt-10" style="font-size:11px; color:var(--gray);">
-        💡 Khi bật, user phải nhấn ENTER trên tool để xác nhận kích hoạt trước khi dùng.
-      </div>
-    </div>
-
-    <!-- TẠO KEY -->
     <div class="card">
       <div class="card-title">🎁 TẠO KEY MỚI</div>
-      <div class="grid grid-4">
+      <div class="grid grid-3">
         <div>
           <label>Loại key</label>
           <select id="newType">
@@ -834,63 +642,69 @@ ADMIN_HTML = r"""
           </select>
         </div>
         <div>
-          <label>Thời hạn (tính từ lúc user nhập)</label>
+          <label>Thời hạn</label>
           <select id="newDuration">
             <option value="24">1 ngày (24h)</option>
             <option value="72">3 ngày (72h)</option>
             <option value="168">1 tuần (168h)</option>
             <option value="720">1 tháng (720h)</option>
-            <option value="880800">Vĩnh viễn</option>
+            <option value="880800">Vĩnh viễn (36700 ngày)</option>
           </select>
         </div>
         <div>
-          <label>Số lượng (1-100)</label>
-          <input type="number" id="newQuantity" value="1" min="1" max="100">
-        </div>
-        <div>
           <label>Ghi chú</label>
-          <input type="text" id="newNote" placeholder="VD: khách A">
+          <input type="text" id="newNote" placeholder="VD: khách A - 500k">
         </div>
       </div>
       <button class="btn btn-primary mt-10" onclick="createKey()">⚡ TẠO KEY</button>
-
       <div id="newKeyResult" class="hidden mt-10">
-        <label>✅ Đã tạo <span id="newKeyCount">0</span> key (trạng thái: <b style="color:var(--red)">CHƯA ACTIVE</b>)</label>
-        <div class="keys-created-list" id="newKeysList"></div>
+        <div class="key-value" id="newKeyValue"></div>
         <div class="btn-row mt-10">
-          <button class="btn btn-primary btn-small" onclick="copyAllNewKeys()">📋 Copy tất cả</button>
-          <button class="btn btn-green btn-small" onclick="activateNewKeys()">✅ Bật Active tất cả</button>
+          <button class="btn btn-primary btn-small" onclick="copyKey()">📋 Copy</button>
           <button class="btn btn-danger btn-small" onclick="hideNewKey()">✖ Đóng</button>
         </div>
       </div>
     </div>
 
-    <!-- EXPORT -->
-    <div class="card">
-      <div class="card-title">📥 XUẤT FILE KEY</div>
+    <!-- 🔥 CARD MỚI: SINH KEY FREE -->
+    <div class="card card-free">
+      <div class="card-title">🧪 SINH KEY FREE (Admin Test — Không qua Link4m)</div>
       <div class="grid grid-3">
         <div>
-          <label>Loại xuất</label>
-          <select id="exportMode">
-            <option value="all">📦 Tất cả</option>
-            <option value="active">✅ Chỉ key đã Active</option>
-            <option value="not_active">🟡 Chỉ key chưa Active</option>
+          <label>Thời hạn (giờ)</label>
+          <select id="freeDuration">
+            <option value="1">1 giờ</option>
+            <option value="6">6 giờ</option>
+            <option value="12">12 giờ</option>
+            <option value="24" selected>1 ngày (24h)</option>
+            <option value="48">2 ngày</option>
+            <option value="72">3 ngày</option>
+            <option value="168">1 tuần</option>
           </select>
         </div>
         <div>
-          <label>Tên file (không cần .txt)</label>
-          <input type="text" id="exportFilename" placeholder="VD: key_vip_1">
+          <label>Số lượng (1-100)</label>
+          <input type="number" id="freeQuantity" value="1" min="1" max="100">
         </div>
-        <div style="display:flex; align-items:flex-end;">
-          <button class="btn btn-primary" style="width:100%" onclick="exportKeys()">📥 XUẤT FILE</button>
+        <div>
+          <label>Ghi chú</label>
+          <input type="text" id="freeNote" placeholder="VD: test key free">
+        </div>
+      </div>
+      <button class="btn btn-purple mt-10" onclick="genFreeKey()">🧪 SINH KEY FREE</button>
+      <div id="freeKeyResult" class="hidden mt-10">
+        <label>✅ Đã sinh <span id="freeKeyCount">0</span> key FREE — dùng cho Logic 1-22</label>
+        <div class="keys-created-list" id="freeKeysList"></div>
+        <div class="btn-row mt-10">
+          <button class="btn btn-primary btn-small" onclick="copyAllFreeKeys()">📋 Copy tất cả</button>
+          <button class="btn btn-danger btn-small" onclick="hideFreeKey()">✖ Đóng</button>
         </div>
       </div>
       <div class="mt-10" style="font-size:11px; color:var(--gray);">
-        💡 Format: <code style="color:var(--cyan)">KEY | TYPE | EXP: YYYY-MM-DD HH:MM:SS</code>
+        💡 Key FREE 7 ký tự, gắn với device khi user nhập. Dùng cho Logic 1-22 trong tool.
       </div>
     </div>
 
-    <!-- DANH SÁCH KEY -->
     <div class="card">
       <div class="card-title">
         📋 DANH SÁCH KEY
@@ -900,17 +714,16 @@ ADMIN_HTML = r"""
         <input type="text" id="filterText" placeholder="🔍 Tìm key..." style="flex:1; min-width:200px;" oninput="renderKeys()">
         <select id="filterStatus" onchange="renderKeys()" style="width:auto;">
           <option value="all">Tất cả</option>
-          <option value="running">Đang dùng</option>
-          <option value="active">Đã Active (chưa dùng)</option>
-          <option value="not_active">Chưa Active</option>
+          <option value="active">Đang hoạt động</option>
           <option value="used">Đã kích hoạt</option>
           <option value="expired">Hết hạn</option>
+          <option value="revoked">Đã thu hồi</option>
+          <option value="free">🆓 FREE</option>
         </select>
       </div>
       <div id="keysList"></div>
     </div>
 
-    <!-- LOGS -->
     <div class="card">
       <div class="card-title">
         📜 NHẬT KÝ
@@ -931,9 +744,8 @@ ADMIN_HTML = r"""
 const API_BASE = window.location.origin;
 let adminSecret = '';
 let cachedKeys = [];
-let lastNewKeys = [];
-let currentMaintenance = false;
-let currentActivation = false;
+let lastKey = null;
+let lastFreeKeys = [];
 
 function toast(msg, type = 'success') {
   const t = document.getElementById('toast');
@@ -977,151 +789,70 @@ function doLogout() {
 function showMain() {
   document.getElementById('loginScreen').classList.add('hidden');
   document.getElementById('mainPanel').classList.remove('hidden');
-  loadStats(); loadKeys(); loadLogs(); loadServerStatus();
-  setInterval(loadServerStatus, 10000);
+  loadStats(); loadKeys(); loadLogs();
 }
 
-// ============ MAINTENANCE + ACTIVATION ============
-async function loadServerStatus() {
-  try {
-    const j = await api('get_status');
-    if (!j.ok) return;
-    currentMaintenance = j.maintenance.enabled;
-    currentActivation = j.activation.required;
-
-    const mtPill = document.getElementById('mtPill');
-    const mtBtn = document.getElementById('mtBtn');
-    const mtContent = document.getElementById('mtContent');
-    if (currentMaintenance) {
-      mtPill.textContent = 'ON';
-      mtPill.className = 'badge badge-on';
-      mtBtn.textContent = '✅ TẮT BẢO TRÌ';
-      mtBtn.className = 'btn btn-green mt-10';
-      mtBtn.style.width = '100%';
-    } else {
-      mtPill.textContent = 'OFF';
-      mtPill.className = 'badge badge-off';
-      mtBtn.textContent = '🔧 BẬT BẢO TRÌ';
-      mtBtn.className = 'btn btn-warn mt-10';
-      mtBtn.style.width = '100%';
-    }
-    if (j.maintenance.content && !mtContent.value) mtContent.value = j.maintenance.content;
-
-    const acPill = document.getElementById('acPill');
-    const acBtn = document.getElementById('acBtn');
-    const acMsg = document.getElementById('acMessage');
-    if (currentActivation) {
-      acPill.textContent = j.activation.activated ? 'ĐÃ KT' : 'CHỜ KT';
-      acPill.className = 'badge badge-on';
-      acBtn.textContent = '✅ TẮT + RESET';
-      acBtn.className = 'btn btn-green mt-10';
-      acBtn.style.width = '100%';
-    } else {
-      acPill.textContent = 'OFF';
-      acPill.className = 'badge badge-off';
-      acBtn.textContent = '⚡ BẬT YÊU CẦU KÍCH HOẠT';
-      acBtn.className = 'btn btn-warn mt-10';
-      acBtn.style.width = '100%';
-    }
-    if (j.activation.message && !acMsg.value) acMsg.value = j.activation.message;
-  } catch (e) {}
-}
-
-async function toggleMaintenance() {
-  const content = document.getElementById('mtContent').value.trim();
-  const newState = !currentMaintenance;
-  if (newState && !content) { toast('⚠️ Nhập nội dung bảo trì!', 'error'); return; }
-  if (newState && !confirm('BẬT BẢO TRÌ? Tất cả tool sẽ thoát!')) return;
-  const j = await api('maintenance', { enabled: newState, content });
-  if (j.ok) {
-    toast(newState ? '🔧 Đã BẬT bảo trì!' : '✅ Đã TẮT bảo trì!', 'success');
-    loadServerStatus();
-  }
-}
-
-async function toggleActivation() {
-  const message = document.getElementById('acMessage').value.trim();
-  const newState = !currentActivation;
-  if (newState && !message) { toast('⚠️ Nhập nội dung!', 'error'); return; }
-  const j = await api('activation', { required: newState, message, reset: !newState });
-  if (j.ok) {
-    toast(newState ? '⚡ Đã BẬT yêu cầu kích hoạt!' : '✅ Đã TẮT + reset!', 'success');
-    loadServerStatus();
-  }
-}
-
-// ============ CREATE KEY ============
+// ============ TẠO KEY VIP ============
 async function createKey() {
   const type = document.getElementById('newType').value;
   const duration = parseInt(document.getElementById('newDuration').value);
-  const quantity = parseInt(document.getElementById('newQuantity').value) || 1;
   const note = document.getElementById('newNote').value.trim();
-  if (quantity < 1 || quantity > 100) { toast('⚠️ Số lượng phải từ 1-100', 'error'); return; }
-
   try {
-    const j = await api('create', { type, duration_hours: duration, quantity, note, created_by: 'admin' });
+    const j = await api('create', { type, duration_hours: duration, note, created_by: 'admin' });
     if (!j.ok) { toast('❌ ' + j.error, 'error'); return; }
-    lastNewKeys = j.keys || [];
-    document.getElementById('newKeyCount').textContent = j.quantity;
-    document.getElementById('newKeysList').innerHTML = lastNewKeys.map(k => `<div>${k}</div>`).join('');
+    lastKey = j.key;
+    document.getElementById('newKeyValue').textContent = j.key;
     document.getElementById('newKeyResult').classList.remove('hidden');
-    toast(`🎉 Tạo ${j.quantity} key thành công!`, 'success');
+    toast('🎉 Tạo key thành công!', 'success');
     loadStats(); loadKeys();
   } catch (e) { toast('❌ ' + e.message, 'error'); }
 }
 
-function copyAllNewKeys() {
-  if (!lastNewKeys.length) return;
-  navigator.clipboard.writeText(lastNewKeys.join('\n')).then(() => toast(`📋 Đã copy ${lastNewKeys.length} key!`, 'success'));
-}
-
-async function activateNewKeys() {
-  if (!lastNewKeys.length) return;
-  if (!confirm(`Bật Active cho ${lastNewKeys.length} key vừa tạo?`)) return;
-  const j = await api('bulk_active', { keys: lastNewKeys, value: 1 });
-  if (j.ok) {
-    toast(`✅ Đã bật Active cho ${j.count} key`, 'success');
-    loadKeys(); loadStats();
-  }
+function copyKey() {
+  if (!lastKey) return;
+  navigator.clipboard.writeText(lastKey).then(() => toast('📋 Đã copy!', 'success'));
 }
 
 function hideNewKey() {
   document.getElementById('newKeyResult').classList.add('hidden');
-  lastNewKeys = [];
+  lastKey = null;
 }
 
-// ============ EXPORT ============
-async function exportKeys() {
-  const mode = document.getElementById('exportMode').value;
-  let filename = document.getElementById('exportFilename').value.trim();
-  if (!filename) {
-    const now = new Date();
-    const stamp = now.getFullYear() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0')
-      + '_' + String(now.getHours()).padStart(2,'0') + String(now.getMinutes()).padStart(2,'0');
-    filename = `keys_${mode}_${stamp}`;
+// ============ SINH KEY FREE ============
+async function genFreeKey() {
+  const duration = parseInt(document.getElementById('freeDuration').value);
+  const quantity = parseInt(document.getElementById('freeQuantity').value) || 1;
+  const note = document.getElementById('freeNote').value.trim();
+
+  if (quantity < 1 || quantity > 100) {
+    toast('⚠️ Số lượng phải từ 1-100', 'error'); return;
   }
+
   try {
-    const r = await fetch(`${API_BASE}/api/admin`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + adminSecret },
-      body: JSON.stringify({ action: 'export', mode, filename }),
-    });
-    if (!r.ok) { const err = await r.json().catch(() => ({})); toast('❌ ' + (err.error || 'Lỗi xuất file'), 'error'); return; }
-    const blob = await r.blob();
-    const finalName = r.headers.get('X-Filename') || (filename + '.txt');
-    const count = r.headers.get('X-Count') || '0';
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = finalName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(a.href);
-    toast(`📥 Đã xuất ${count} key → ${finalName}`, 'success');
+    const j = await api('gen_free_key', { duration_hours: duration, quantity, note });
+    if (!j.ok) { toast('❌ ' + j.error, 'error'); return; }
+    lastFreeKeys = j.keys || [];
+    document.getElementById('freeKeyCount').textContent = j.quantity;
+    document.getElementById('freeKeysList').innerHTML =
+      lastFreeKeys.map(k => `<div>${k}</div>`).join('');
+    document.getElementById('freeKeyResult').classList.remove('hidden');
+    toast(`🧪 Đã sinh ${j.quantity} key FREE!`, 'success');
+    loadStats(); loadKeys();
   } catch (e) { toast('❌ ' + e.message, 'error'); }
 }
 
-// ============ LIST KEYS ============
+function copyAllFreeKeys() {
+  if (!lastFreeKeys.length) return;
+  navigator.clipboard.writeText(lastFreeKeys.join('\n'))
+    .then(() => toast(`📋 Đã copy ${lastFreeKeys.length} key FREE!`, 'success'));
+}
+
+function hideFreeKey() {
+  document.getElementById('freeKeyResult').classList.add('hidden');
+  lastFreeKeys = [];
+}
+
+// ============ DANH SÁCH KEY ============
 async function loadKeys() {
   try {
     const j = await api('list');
@@ -1133,10 +864,9 @@ async function loadKeys() {
 
 function getKeyStatus(k) {
   const now = Date.now();
-  if (k.active != 1) return 'not_active';
-  if (!k.first_used_at) return 'active';
-  if (k.expires_at && k.expires_at < now && k.type !== 'ADMIN') return 'expired';
-  return 'running';
+  if (!k.active) return 'revoked';
+  if (k.expires_at < now && k.type !== 'ADMIN') return 'expired';
+  return 'active';
 }
 
 function formatTime(ts) {
@@ -1160,12 +890,12 @@ function renderKeys() {
 
   let list = cachedKeys.filter(k => {
     if (filterText && !k.key.toLowerCase().includes(filterText) && !(k.note || '').toLowerCase().includes(filterText)) return false;
+    if (filterStatus === 'free' && k.type !== 'FREE') return false;
     const st = getKeyStatus(k);
     if (filterStatus === 'active' && st !== 'active') return false;
-    if (filterStatus === 'not_active' && st !== 'not_active') return false;
-    if (filterStatus === 'running' && st !== 'running') return false;
     if (filterStatus === 'expired' && st !== 'expired') return false;
-    if (filterStatus === 'used' && !k.first_used_at) return false;
+    if (filterStatus === 'revoked' && st !== 'revoked') return false;
+    if (filterStatus === 'used' && !k.device_id) return false;
     return true;
   });
 
@@ -1176,26 +906,19 @@ function renderKeys() {
 
   box.innerHTML = list.map(k => {
     const st = getKeyStatus(k);
-    const statusBadge =
-      st === 'running' ? '<span class="badge badge-running">🟢 ĐANG DÙNG</span>'
-      : st === 'active' ? '<span class="badge badge-active">🔵 ĐÃ ACTIVE (chưa dùng)</span>'
-      : st === 'not_active' ? '<span class="badge badge-not-active">🔴 CHƯA ACTIVE</span>'
-      : '<span class="badge badge-expired">⏰ HẾT HẠN</span>';
-
+    const statusBadge = st === 'active' ? '<span class="badge badge-active">✅ ACTIVE</span>'
+      : st === 'expired' ? '<span class="badge badge-expired">⏰ HẾT HẠN</span>'
+      : '<span class="badge badge-revoked">❌ THU HỒI</span>';
     const typeBadge = {
-      VIP1: '<span class="badge badge-vip1">🔓 VIP1</span>',
-      VIP3: '<span class="badge badge-vip3">🔐 VIP3</span>',
+      VIP1:  '<span class="badge badge-vip1">🔓 VIP1</span>',
+      VIP3:  '<span class="badge badge-vip3">🔐 VIP3</span>',
       SUPER: '<span class="badge badge-super">👑 SUPER</span>',
       ADMIN: '<span class="badge badge-admin">⚡ ADMIN</span>',
+      FREE:  '<span class="badge badge-free">🆓 FREE</span>',
     }[k.type] || '';
-
-    let remain;
-    if (k.type === 'ADMIN') remain = 'VĨNH VIỄN';
-    else if (!k.first_used_at) remain = 'Chưa bắt đầu';
-    else remain = formatDuration(k.expires_at - now);
-
+    const remain = k.type === 'ADMIN' ? 'VĨNH VIỄN' : formatDuration(k.expires_at - now);
     const deviceShort = k.device_id ? k.device_id.substring(0, 16) + '...' : 'chưa dùng';
-    const itemClass = st === 'not_active' ? 'key-item not-active' : st === 'running' ? 'key-item running' : 'key-item';
+    const itemClass = k.type === 'FREE' ? 'key-item free' : 'key-item';
 
     return `
       <div class="${itemClass}">
@@ -1213,10 +936,9 @@ function renderKeys() {
         </div>
         <div class="btn-row mt-10">
           <button class="btn btn-primary btn-small" onclick="copyAnyKey('${k.key}')">📋 Copy</button>
-          ${k.active == 1
-            ? `<button class="btn btn-warn btn-small" onclick="setActive('${k.key}', 0)">⏸️ Tắt Active</button>`
-            : `<button class="btn btn-green btn-small" onclick="setActive('${k.key}', 1)">✅ Bật Active</button>`}
-          ${k.first_used_at ? `<button class="btn btn-warn btn-small" onclick="resetDevice('${k.key}')">📱 Reset</button>` : ''}
+          ${st === 'active' ? `<button class="btn btn-warn btn-small" onclick="revokeKey('${k.key}')">🚫 Thu hồi</button>` : ''}
+          ${st === 'revoked' ? `<button class="btn btn-primary btn-small" onclick="reactivateKey('${k.key}')">✅ Bật lại</button>` : ''}
+          ${k.device_id ? `<button class="btn btn-warn btn-small" onclick="resetDevice('${k.key}')">📱 Reset</button>` : ''}
           <button class="btn btn-primary btn-small" onclick="extendKey('${k.key}')">➕ Gia hạn</button>
           <button class="btn btn-danger btn-small" onclick="deleteKey('${k.key}')">🗑️ Xoá</button>
         </div>
@@ -1226,17 +948,20 @@ function renderKeys() {
 
 function copyAnyKey(k) { navigator.clipboard.writeText(k).then(() => toast('📋 Copy!', 'success')); }
 
-async function setActive(key, value) {
-  const j = await api('set_active', { key, value });
-  if (j.ok) {
-    toast(value === 1 ? '✅ Đã bật Active' : '⏸️ Đã tắt Active', 'success');
-    loadKeys(); loadStats();
-  }
+async function revokeKey(key) {
+  const reason = prompt('Lý do?', 'Admin revoked');
+  if (reason === null) return;
+  const j = await api('revoke', { key, reason });
+  if (j.ok) { toast('🚫 Đã thu hồi', 'success'); loadKeys(); loadStats(); }
+}
+async function reactivateKey(key) {
+  const j = await api('reactivate', { key });
+  if (j.ok) { toast('✅ Đã bật lại', 'success'); loadKeys(); loadStats(); }
 }
 async function resetDevice(key) {
-  if (!confirm('Reset device và hạn? (Key sẽ về trạng thái chưa dùng)')) return;
+  if (!confirm('Reset device?')) return;
   const j = await api('reset_device', { key });
-  if (j.ok) { toast('📱 Đã reset', 'success'); loadKeys(); loadStats(); }
+  if (j.ok) { toast('📱 Đã reset', 'success'); loadKeys(); }
 }
 async function extendKey(key) {
   const h = prompt('Gia hạn bao nhiêu giờ?', '24');
@@ -1255,8 +980,8 @@ async function loadStats() {
   if (!j.ok) return;
   document.getElementById('statTotal').textContent = j.stats.total;
   document.getElementById('statActive').textContent = j.stats.active;
-  document.getElementById('statRunning').textContent = j.stats.running;
-  document.getElementById('statNotActive').textContent = j.stats.notActive;
+  document.getElementById('statUsed').textContent = j.stats.used;
+  document.getElementById('statRevoked').textContent = j.stats.revoked;
 }
 
 async function loadLogs() {
@@ -1268,13 +993,8 @@ async function loadLogs() {
     const time = new Date(l.ts).toLocaleString('vi-VN');
     const color = {
       create:'var(--green)', validate_ok:'var(--cyan)', bind_device:'var(--yellow)',
-      first_use_start_timer:'var(--green)', set_active:'var(--cyan)',
-      set_active_bulk:'var(--cyan)', export:'var(--yellow)',
-      validate_failed_not_active:'var(--red)', reset_device:'var(--yellow)',
-      delete:'var(--red)', extend:'var(--green)',
-      maintenance_on:'var(--red)', maintenance_off:'var(--green)',
-      activation_on:'var(--yellow)', activation_off:'var(--green)',
-      activation_confirmed:'var(--green)'
+      revoke:'var(--red)', delete:'var(--red)', extend:'var(--green)',
+      gen_free_key:'var(--purple)'
     }[l.action] || 'var(--white)';
     return `<div style="padding:8px; border-bottom:1px solid rgba(0,212,255,0.1); font-size:12px;">
       <span style="color:${color}; font-weight:700;">${l.action}</span>
