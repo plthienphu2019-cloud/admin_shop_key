@@ -2,7 +2,7 @@
 # ==============================================================
 # LP-TOOL KEY SERVER — Render.com Edition
 # Admin: Thiên Phú - Minh Lâm
-# Key chỉ tính hạn từ lúc user nhập lần đầu + Nút Active toggle
+# Đầy đủ: Bảo trì + Kích hoạt + Key + Active + Export + Batch + Timer-from-first-use
 # ==============================================================
 
 from __future__ import annotations
@@ -25,6 +25,23 @@ ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "LpToolAdmin@2026")
 DB_PATH = os.environ.get("DB_PATH", "keys.db")
 
 app = Flask(__name__)
+
+# ==============================================================
+# STATE — Bảo trì + Kích hoạt (RAM)
+# ==============================================================
+
+MAINTENANCE = {
+    "enabled": False,
+    "content": "",
+    "enabled_at": None,
+}
+ACTIVATION = {
+    "required": False,
+    "activated": False,
+    "message": "Vui lòng nhấn KÍCH HOẠT để bắt đầu sử dụng tool",
+    "activated_at": None,
+    "activated_by": None,
+}
 
 # ==============================================================
 # DATABASE
@@ -131,7 +148,63 @@ def require_admin(f):
 
 
 # ==============================================================
-# API: VALIDATE — Timer bắt đầu khi user nhập key lần đầu
+# API: CHECK STATUS — Tool gọi định kỳ
+# ==============================================================
+
+@app.route("/api/check_status", methods=["GET", "POST", "OPTIONS"])
+def api_check_status():
+    if request.method == "OPTIONS":
+        return "", 200
+    return jsonify({
+        "ok": True,
+        "maintenance": MAINTENANCE["enabled"],
+        "maintenance_content": MAINTENANCE["content"],
+        "need_activation": ACTIVATION["required"],
+        "activated": ACTIVATION["activated"],
+        "activation_message": ACTIVATION["message"],
+        "ts": int(time.time() * 1000),
+    })
+
+
+# ==============================================================
+# API: ACTIVATE — User nhấn ENTER
+# ==============================================================
+
+@app.route("/api/activate", methods=["POST", "OPTIONS"])
+def api_activate():
+    if request.method == "OPTIONS":
+        return "", 200
+    data = request.get_json(silent=True) or {}
+    key_str = (data.get("key") or "").strip()
+    device_id = (data.get("device_id") or "").strip()
+
+    if not key_str:
+        return jsonify({"ok": False, "error": "Thiếu key"}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+    row = c.execute("SELECT * FROM keys WHERE key=?", (key_str,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"ok": False, "error": "Key không tồn tại"}), 404
+
+    if not ACTIVATION["required"]:
+        return jsonify({"ok": True, "message": "Không cần kích hoạt", "skip": True})
+
+    ACTIVATION["activated"] = True
+    ACTIVATION["activated_at"] = int(time.time() * 1000)
+    ACTIVATION["activated_by"] = key_str
+    log_action(key_str, "activation_confirmed", device_id)
+
+    return jsonify({
+        "ok": True,
+        "message": "✅ Kích hoạt thành công!",
+        "activated_at": ACTIVATION["activated_at"],
+    })
+
+
+# ==============================================================
+# API: VALIDATE — Timer bắt đầu từ lúc user nhập lần đầu
 # ==============================================================
 
 @app.route("/api/validate", methods=["POST", "OPTIONS"])
@@ -159,7 +232,7 @@ def api_validate():
     row = dict(row)
     now_ms = int(time.time() * 1000)
 
-    # ⚡ CHECK ACTIVE — key phải được Admin bật mới dùng được
+    # ⚡ Check Active
     if row["active"] != 1:
         log_action(key_str, "validate_failed_not_active", device_id, ip)
         conn.close()
@@ -169,9 +242,8 @@ def api_validate():
             "need_activation": True
         }), 403
 
-    # ⚡ KEY CHƯA DÙNG LẦN NÀO → BẮT ĐẦU TÍNH HẠN TỪ BÂY GIỜ
+    # ⚡ Key chưa dùng lần nào → tính hạn từ bây giờ
     if not row["first_used_at"]:
-        # set expires_at = now + duration_hours
         new_expires = now_ms + int(row["duration_hours"]) * 3600 * 1000
         c.execute("""
             UPDATE keys SET
@@ -198,7 +270,7 @@ def api_validate():
             "message": "Kích hoạt lần đầu thành công — bắt đầu tính hạn"
         })
 
-    # ⚡ KEY ĐÃ DÙNG → check hết hạn
+    # ⚡ Đã dùng → check hết hạn
     if row["expires_at"] < now_ms and row["type"] != "ADMIN":
         log_action(key_str, "validate_failed_expired", device_id, ip)
         conn.close()
@@ -208,7 +280,7 @@ def api_validate():
             "expired_at": row["expires_at"]
         }), 403
 
-    # ⚡ CHECK DEVICE
+    # ⚡ Check device
     if not row["device_id"]:
         c.execute("""
             UPDATE keys SET device_id=?, device_fingerprint=?, last_seen=?, last_ip=?,
@@ -309,7 +381,7 @@ def api_admin():
     conn = get_db()
     c = conn.cursor()
 
-    # ============ CREATE (mặc định active=0, expires_at=0) ============
+    # ============ CREATE (mặc định active=0, expires=0) ============
     if action == "create":
         key_type = data.get("type", "VIP1")
         duration_hours = int(data.get("duration_hours", 24))
@@ -338,7 +410,6 @@ def api_admin():
                 if not exists:
                     break
             try:
-                # ⚡ active=0 mặc định, expires_at=0 (chưa tính)
                 c.execute("""
                     INSERT INTO keys (key, type, duration_hours, created_at, expires_at,
                                       active, created_by, note)
@@ -426,7 +497,7 @@ def api_admin():
         conn.close()
         return jsonify({"ok": True, "message": "Đã xoá key"})
 
-    # ============ RESET DEVICE ============
+    # ============ RESET DEVICE + RESET TIMER ============
     if action == "reset_device":
         key_str = data.get("key")
         c.execute("""
@@ -460,6 +531,44 @@ def api_admin():
         conn.close()
         return jsonify({"ok": True, "message": "Đã gia hạn", "expires_at": new_exp})
 
+    # ============ MAINTENANCE ============
+    if action == "maintenance":
+        enabled = bool(data.get("enabled", False))
+        content = str(data.get("content", "")).strip()
+        MAINTENANCE["enabled"] = enabled
+        MAINTENANCE["content"] = content
+        MAINTENANCE["enabled_at"] = int(time.time() * 1000) if enabled else None
+        conn.close()
+        log_action(None, "maintenance_" + ("on" if enabled else "off"),
+                   None, None, {"content": content})
+        return jsonify({"ok": True, "maintenance": MAINTENANCE})
+
+    # ============ ACTIVATION ============
+    if action == "activation":
+        required = bool(data.get("required", False))
+        message = str(data.get("message", "")).strip()
+        reset = bool(data.get("reset", False))
+        ACTIVATION["required"] = required
+        if message:
+            ACTIVATION["message"] = message
+        if reset or not required:
+            ACTIVATION["activated"] = False
+            ACTIVATION["activated_at"] = None
+            ACTIVATION["activated_by"] = None
+        conn.close()
+        log_action(None, "activation_" + ("on" if required else "off"),
+                   None, None, {"msg": message})
+        return jsonify({"ok": True, "activation": ACTIVATION})
+
+    # ============ GET STATUS ============
+    if action == "get_status":
+        conn.close()
+        return jsonify({
+            "ok": True,
+            "maintenance": MAINTENANCE,
+            "activation": ACTIVATION,
+        })
+
     # ============ STATS ============
     if action == "stats":
         total = c.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
@@ -467,7 +576,6 @@ def api_admin():
         used = c.execute("SELECT COUNT(*) FROM keys WHERE first_used_at IS NOT NULL").fetchone()[0]
         not_active = c.execute("SELECT COUNT(*) FROM keys WHERE active=0").fetchone()[0]
         active = c.execute("SELECT COUNT(*) FROM keys WHERE active=1").fetchone()[0]
-        # key còn hạn (đã active + đã dùng + chưa hết hạn)
         running = c.execute("""
             SELECT COUNT(*) FROM keys
             WHERE active=1 AND first_used_at IS NOT NULL AND (expires_at > ? OR type='ADMIN')
@@ -585,7 +693,7 @@ ADMIN_HTML = r"""
     background: rgba(5,10,20,0.8); border: 1px solid rgba(0,212,255,0.25);
     border-radius: 8px; color: var(--white); font-size: 14px; outline: none;
     font-family: 'Consolas', monospace; }
-  input:focus, select:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(0,212,255,0.15); }
+  input:focus, select:focus, textarea:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(0,212,255,0.15); }
   .grid { display: grid; gap: 12px; }
   .grid-4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
   .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
@@ -608,7 +716,8 @@ ADMIN_HTML = r"""
   .key-item.running { border-color: rgba(0,230,118,0.35); }
   .key-header { display: flex; justify-content: space-between; align-items: center;
     margin-bottom: 8px; flex-wrap: wrap; gap: 6px; }
-  .badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; }
+  .badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 700;
+    display: inline-block; }
   .badge-vip1 { background: rgba(0,230,118,0.15); color: var(--green); }
   .badge-vip3 { background: rgba(96,165,250,0.15); color: var(--blue-light); }
   .badge-super { background: rgba(255,215,64,0.15); color: var(--yellow); }
@@ -617,6 +726,8 @@ ADMIN_HTML = r"""
   .badge-active { background: rgba(0,212,255,0.15); color: var(--cyan); }
   .badge-not-active { background: rgba(255,77,109,0.15); color: var(--red); }
   .badge-expired { background: rgba(122,140,163,0.15); color: var(--gray); }
+  .badge-on { background: rgba(255,77,109,0.2); color: var(--red); }
+  .badge-off { background: rgba(0,230,118,0.2); color: var(--green); }
   .key-value { font-family: 'Consolas', monospace; font-size: 12px;
     color: var(--cyan); background: rgba(0,0,0,0.4);
     padding: 8px 10px; border-radius: 6px;
@@ -669,9 +780,10 @@ ADMIN_HTML = r"""
   <div id="mainPanel" class="hidden">
     <div class="header">
       <div class="logo">LP KEY ADMIN</div>
-      <div class="subtitle">⚡ KEY TÍNH HẠN TỪ LÚC DÙNG ⚡</div>
+      <div class="subtitle">⚡ QUẢN LÝ KEY + BẢO TRÌ + KÍCH HOẠT ⚡</div>
     </div>
 
+    <!-- STATS -->
     <div class="card">
       <div class="card-title">📊 THỐNG KÊ</div>
       <div class="stats">
@@ -682,6 +794,33 @@ ADMIN_HTML = r"""
       </div>
     </div>
 
+    <!-- BẢO TRÌ -->
+    <div class="card">
+      <div class="card-title">🔧 BẢO TRÌ <span id="mtPill" class="badge badge-off">OFF</span></div>
+      <div>
+        <label>Nội dung thông báo</label>
+        <textarea id="mtContent" rows="3" placeholder="Server đang nâng cấp, quay lại sau..."></textarea>
+      </div>
+      <button class="btn btn-warn mt-10" id="mtBtn" style="width:100%" onclick="toggleMaintenance()">🔧 BẬT BẢO TRÌ</button>
+      <div class="mt-10" style="font-size:11px; color:var(--gray);">
+        💡 Bật bảo trì → tất cả tool đang chạy sẽ hiện thông báo và tự thoát (trừ tool bật treo 24/7).
+      </div>
+    </div>
+
+    <!-- KÍCH HOẠT -->
+    <div class="card">
+      <div class="card-title">⚡ YÊU CẦU KÍCH HOẠT <span id="acPill" class="badge badge-off">OFF</span></div>
+      <div>
+        <label>Nội dung yêu cầu user</label>
+        <input type="text" id="acMessage" value="Vui lòng nhấn KÍCH HOẠT để bắt đầu sử dụng tool">
+      </div>
+      <button class="btn btn-warn mt-10" id="acBtn" style="width:100%" onclick="toggleActivation()">⚡ BẬT YÊU CẦU KÍCH HOẠT</button>
+      <div class="mt-10" style="font-size:11px; color:var(--gray);">
+        💡 Khi bật, user phải nhấn ENTER trên tool để xác nhận kích hoạt trước khi dùng.
+      </div>
+    </div>
+
+    <!-- TẠO KEY -->
     <div class="card">
       <div class="card-title">🎁 TẠO KEY MỚI</div>
       <div class="grid grid-4">
@@ -726,6 +865,7 @@ ADMIN_HTML = r"""
       </div>
     </div>
 
+    <!-- EXPORT -->
     <div class="card">
       <div class="card-title">📥 XUẤT FILE KEY</div>
       <div class="grid grid-3">
@@ -747,10 +887,10 @@ ADMIN_HTML = r"""
       </div>
       <div class="mt-10" style="font-size:11px; color:var(--gray);">
         💡 Format: <code style="color:var(--cyan)">KEY | TYPE | EXP: YYYY-MM-DD HH:MM:SS</code>
-        (EXP = <b>NOT_STARTED</b> nếu user chưa nhập key lần nào)
       </div>
     </div>
 
+    <!-- DANH SÁCH KEY -->
     <div class="card">
       <div class="card-title">
         📋 DANH SÁCH KEY
@@ -770,6 +910,7 @@ ADMIN_HTML = r"""
       <div id="keysList"></div>
     </div>
 
+    <!-- LOGS -->
     <div class="card">
       <div class="card-title">
         📜 NHẬT KÝ
@@ -791,6 +932,8 @@ const API_BASE = window.location.origin;
 let adminSecret = '';
 let cachedKeys = [];
 let lastNewKeys = [];
+let currentMaintenance = false;
+let currentActivation = false;
 
 function toast(msg, type = 'success') {
   const t = document.getElementById('toast');
@@ -834,9 +977,80 @@ function doLogout() {
 function showMain() {
   document.getElementById('loginScreen').classList.add('hidden');
   document.getElementById('mainPanel').classList.remove('hidden');
-  loadStats(); loadKeys(); loadLogs();
+  loadStats(); loadKeys(); loadLogs(); loadServerStatus();
+  setInterval(loadServerStatus, 10000);
 }
 
+// ============ MAINTENANCE + ACTIVATION ============
+async function loadServerStatus() {
+  try {
+    const j = await api('get_status');
+    if (!j.ok) return;
+    currentMaintenance = j.maintenance.enabled;
+    currentActivation = j.activation.required;
+
+    const mtPill = document.getElementById('mtPill');
+    const mtBtn = document.getElementById('mtBtn');
+    const mtContent = document.getElementById('mtContent');
+    if (currentMaintenance) {
+      mtPill.textContent = 'ON';
+      mtPill.className = 'badge badge-on';
+      mtBtn.textContent = '✅ TẮT BẢO TRÌ';
+      mtBtn.className = 'btn btn-green mt-10';
+      mtBtn.style.width = '100%';
+    } else {
+      mtPill.textContent = 'OFF';
+      mtPill.className = 'badge badge-off';
+      mtBtn.textContent = '🔧 BẬT BẢO TRÌ';
+      mtBtn.className = 'btn btn-warn mt-10';
+      mtBtn.style.width = '100%';
+    }
+    if (j.maintenance.content && !mtContent.value) mtContent.value = j.maintenance.content;
+
+    const acPill = document.getElementById('acPill');
+    const acBtn = document.getElementById('acBtn');
+    const acMsg = document.getElementById('acMessage');
+    if (currentActivation) {
+      acPill.textContent = j.activation.activated ? 'ĐÃ KT' : 'CHỜ KT';
+      acPill.className = 'badge badge-on';
+      acBtn.textContent = '✅ TẮT + RESET';
+      acBtn.className = 'btn btn-green mt-10';
+      acBtn.style.width = '100%';
+    } else {
+      acPill.textContent = 'OFF';
+      acPill.className = 'badge badge-off';
+      acBtn.textContent = '⚡ BẬT YÊU CẦU KÍCH HOẠT';
+      acBtn.className = 'btn btn-warn mt-10';
+      acBtn.style.width = '100%';
+    }
+    if (j.activation.message && !acMsg.value) acMsg.value = j.activation.message;
+  } catch (e) {}
+}
+
+async function toggleMaintenance() {
+  const content = document.getElementById('mtContent').value.trim();
+  const newState = !currentMaintenance;
+  if (newState && !content) { toast('⚠️ Nhập nội dung bảo trì!', 'error'); return; }
+  if (newState && !confirm('BẬT BẢO TRÌ? Tất cả tool sẽ thoát!')) return;
+  const j = await api('maintenance', { enabled: newState, content });
+  if (j.ok) {
+    toast(newState ? '🔧 Đã BẬT bảo trì!' : '✅ Đã TẮT bảo trì!', 'success');
+    loadServerStatus();
+  }
+}
+
+async function toggleActivation() {
+  const message = document.getElementById('acMessage').value.trim();
+  const newState = !currentActivation;
+  if (newState && !message) { toast('⚠️ Nhập nội dung!', 'error'); return; }
+  const j = await api('activation', { required: newState, message, reset: !newState });
+  if (j.ok) {
+    toast(newState ? '⚡ Đã BẬT yêu cầu kích hoạt!' : '✅ Đã TẮT + reset!', 'success');
+    loadServerStatus();
+  }
+}
+
+// ============ CREATE KEY ============
 async function createKey() {
   const type = document.getElementById('newType').value;
   const duration = parseInt(document.getElementById('newDuration').value);
@@ -876,6 +1090,7 @@ function hideNewKey() {
   lastNewKeys = [];
 }
 
+// ============ EXPORT ============
 async function exportKeys() {
   const mode = document.getElementById('exportMode').value;
   let filename = document.getElementById('exportFilename').value.trim();
@@ -885,7 +1100,6 @@ async function exportKeys() {
       + '_' + String(now.getHours()).padStart(2,'0') + String(now.getMinutes()).padStart(2,'0');
     filename = `keys_${mode}_${stamp}`;
   }
-
   try {
     const r = await fetch(`${API_BASE}/api/admin`, {
       method: 'POST',
@@ -893,11 +1107,9 @@ async function exportKeys() {
       body: JSON.stringify({ action: 'export', mode, filename }),
     });
     if (!r.ok) { const err = await r.json().catch(() => ({})); toast('❌ ' + (err.error || 'Lỗi xuất file'), 'error'); return; }
-
     const blob = await r.blob();
     const finalName = r.headers.get('X-Filename') || (filename + '.txt');
     const count = r.headers.get('X-Count') || '0';
-
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = finalName;
@@ -905,11 +1117,11 @@ async function exportKeys() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(a.href);
-
     toast(`📥 Đã xuất ${count} key → ${finalName}`, 'success');
   } catch (e) { toast('❌ ' + e.message, 'error'); }
 }
 
+// ============ LIST KEYS ============
 async function loadKeys() {
   try {
     const j = await api('list');
@@ -919,15 +1131,10 @@ async function loadKeys() {
   } catch (e) { toast('❌ ' + e.message, 'error'); }
 }
 
-// Trạng thái key:
-// - not_active: chưa bật nút Active
-// - active: đã bật Active nhưng user chưa nhập (chưa tính hạn)
-// - running: đã Active + user đã nhập + còn hạn
-// - expired: đã Active + user đã nhập + hết hạn
 function getKeyStatus(k) {
   const now = Date.now();
   if (k.active != 1) return 'not_active';
-  if (!k.first_used_at) return 'active';   // Đã Active nhưng chưa ai dùng
+  if (!k.first_used_at) return 'active';
   if (k.expires_at && k.expires_at < now && k.type !== 'ADMIN') return 'expired';
   return 'running';
 }
@@ -1026,7 +1233,6 @@ async function setActive(key, value) {
     loadKeys(); loadStats();
   }
 }
-
 async function resetDevice(key) {
   if (!confirm('Reset device và hạn? (Key sẽ về trạng thái chưa dùng)')) return;
   const j = await api('reset_device', { key });
@@ -1065,7 +1271,10 @@ async function loadLogs() {
       first_use_start_timer:'var(--green)', set_active:'var(--cyan)',
       set_active_bulk:'var(--cyan)', export:'var(--yellow)',
       validate_failed_not_active:'var(--red)', reset_device:'var(--yellow)',
-      delete:'var(--red)', extend:'var(--green)'
+      delete:'var(--red)', extend:'var(--green)',
+      maintenance_on:'var(--red)', maintenance_off:'var(--green)',
+      activation_on:'var(--yellow)', activation_off:'var(--green)',
+      activation_confirmed:'var(--green)'
     }[l.action] || 'var(--white)';
     return `<div style="padding:8px; border-bottom:1px solid rgba(0,212,255,0.1); font-size:12px;">
       <span style="color:${color}; font-weight:700;">${l.action}</span>
